@@ -6,16 +6,24 @@ from datetime import datetime
 import websocket
 import requests
 from flask import Flask, request, jsonify, redirect
-import time  # Aggiunto per il sleep nel reconnect
+from flask_cors import CORS
+import time
 
 # ===============================
 # CONFIG
 # ===============================
 DB_PATH = "alerts.db"
 PORT = int(os.environ.get("PORT", 5000))
-# Prezzi in RAM + prev_price per cross
+
+# Prezzi in RAM + prev_price per cross detection
 prices = {"bybit": {}, "binance": {}}
 prev_prices = {"bybit": {}, "binance": {}}
+
+# WebSocket global per Bybit (per subscribe dinamiche)
+bybit_ws = None
+
+# Dominio del tuo server Render (sostituisci se cambia)
+SERVER_DOMAIN = "https://srazu-bot.onrender.com"
 
 # ===============================
 # DATABASE
@@ -60,6 +68,10 @@ def upsert_alert(data):
     conn.commit()
     conn.close()
 
+    # Subscribe dinamica per Bybit se necessario
+    if data['exchange'] == "bybit":
+        subscribe_bybit_symbol(data['symbol'])
+
 def remove_alert(device_id, exchange, symbol):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -84,11 +96,24 @@ def mark_triggered(alert_id):
     conn.close()
 
 # ===============================
+# BYBIT SUBSCRIBE DINAMICA
+# ===============================
+def subscribe_bybit_symbol(symbol):
+    global bybit_ws
+    if bybit_ws:
+        try:
+            msg = json.dumps({"op": "subscribe", "args": [f"tickers.{symbol}"]})
+            bybit_ws.send(msg)
+            print(f"[BYBIT] Subscribed to new symbol: {symbol}")
+        except Exception as e:
+            print(f"[BYBIT] Subscribe error: {e}")
+
+# ===============================
 # TELEGRAM
 # ===============================
 def send_telegram(bot_token, chat_id, message, exchange, symbol):
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    trade_url = f"http://your-server-domain.com:{PORT}/open_trade?exchange={exchange}&symbol={symbol}"  # Sostituisci con il tuo dominio/IP e porta
+    trade_url = f"{SERVER_DOMAIN}/open_trade?exchange={exchange}&symbol={symbol}"
     keyboard = {
         "inline_keyboard": [[
             {"text": "Open Trade Now", "url": trade_url}
@@ -117,41 +142,57 @@ def check_all_alerts():
             continue
         current_price = prices[exchange][symbol]
         prev_price = prev_prices[exchange].get(symbol, current_price)
+
         triggered = False
         if (prev_price < target_price <= current_price) or (prev_price > target_price >= current_price):
             triggered = True
 
         if triggered:
-            message = f" <b>ALERT {exchange.upper()} {symbol}</b>\nPrice reached: <b>{current_price:.8f}</b>\nTarget: <b>{target_price:.8f}</b>"
+            message = f"🚨 <b>ALERT {exchange.upper()} {symbol}</b>\nPrice reached: <b>{current_price:.8f}</b>\nTarget: <b>{target_price:.8f}</b>"
             if horiz_price is not None:
                 message += f"\nSynchronized line: <b>{horiz_price:.8f}</b>"
             send_telegram(bot_token, chat_id, message, exchange, symbol)
             mark_triggered(alert_id)
             print(f"[TRIGGERED] {device_id} {exchange} {symbol} at {current_price}")
 
+        # Aggiorna prev_price per il prossimo check
         prev_prices[exchange][symbol] = current_price
 
+# Thread che forza il check ogni 2 secondi
+def alert_checker_thread():
+    while True:
+        time.sleep(2)
+        check_all_alerts()
+
 # ===============================
-# WEBSOCKET BYBIT
+# WEBSOCKET BYBIT (V5)
 # ===============================
 def bybit_ws_thread():
-    url = "wss://stream.bybit.com/realtime_public"
+    global bybit_ws
+    url = "wss://stream.bybit.com/v5/public/linear"
 
     def on_open(ws):
+        global bybit_ws
+        bybit_ws = ws
         print("[BYBIT] Connected")
-        # Sottoscrivi tutti i symbol attivi
-        symbols = [row[5] for row in get_active_alerts() if row[4] == "bybit"]
-        for sym in set(symbols):
-            ws.send(json.dumps({"op": "subscribe", "args": [f"ticker.{sym}"]}))
+        # Sottoscrivi tutti i symbol attivi all'avvio
+        alerts = get_active_alerts()
+        symbols = {row[5] for row in alerts if row[4] == "bybit"}
+        for sym in symbols:
+            ws.send(json.dumps({"op": "subscribe", "args": [f"tickers.{sym}"]}))
+            print(f"[BYBIT] Subscribed to {sym}")
 
     def on_message(ws, message):
         try:
             data = json.loads(message)
-            if "topic" in data and "ticker" in data["topic"]:
-                symbol = data["data"]["symbol"]
-                price = float(data["data"]["last_price"])
-                prices["bybit"][symbol] = price
-                check_all_alerts()
+            if data.get("topic", "").startswith("tickers."):
+                symbol = data["topic"].split(".")[1]
+                price_data = data.get("data", {})
+                if isinstance(price_data, dict):
+                    price = float(price_data.get("lastPrice", 0))
+                    if price > 0:
+                        prices["bybit"][symbol] = price
+                        check_all_alerts()
         except Exception as e:
             print(f"[BYBIT MSG ERROR] {e}")
 
@@ -159,11 +200,14 @@ def bybit_ws_thread():
         print(f"[BYBIT ERROR] {error}")
 
     def on_close(ws, *args):
-        print("[BYBIT] Closed, reconnecting...")
+        global bybit_ws
+        bybit_ws = None
+        print("[BYBIT] Closed, reconnecting in 5s...")
         time.sleep(5)
         bybit_ws_thread()
 
-    ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+    ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message,
+                                on_error=on_error, on_close=on_close)
     ws.run_forever()
 
 # ===============================
@@ -191,22 +235,25 @@ def binance_ws_thread():
         print(f"[BINANCE ERROR] {error}")
 
     def on_close(ws, *args):
-        print("[BINANCE] Closed, reconnecting...")
+        print("[BINANCE] Closed, reconnecting in 5s...")
         time.sleep(5)
         binance_ws_thread()
 
-    ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+    ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message,
+                                on_error=on_error, on_close=on_close)
     ws.run_forever()
 
 # ===============================
 # FLASK APP
 # ===============================
 app = Flask(__name__)
+CORS(app)  # Permette tutte le origini (per test). Per produzione: CORS(app, origins=["https://srazu.vercel.app"])
 
 @app.post("/add_alert")
 def add_alert():
     data = request.get_json()
-    if not all(k in data for k in ["device_id", "bot_token", "chat_id", "exchange", "symbol", "target_price"]):
+    required = ["device_id", "bot_token", "chat_id", "exchange", "symbol", "target_price"]
+    if not all(k in data for k in required):
         return jsonify({"error": "missing fields"}), 400
     upsert_alert(data)
     return jsonify({"status": "added"})
@@ -214,13 +261,14 @@ def add_alert():
 @app.post("/update_alert")
 def update_alert():
     data = request.get_json()
-    if not all(k in data for k in ["device_id", "bot_token", "chat_id", "exchange", "symbol", "target_price"]):
+    required = ["device_id", "bot_token", "chat_id", "exchange", "symbol", "target_price"]
+    if not all(k in data for k in required):
         return jsonify({"error": "missing fields"}), 400
     upsert_alert(data)
     return jsonify({"status": "updated"})
 
 @app.post("/remove_alert")
-def remove_alert_route():  # Rinominato per evitare conflitto con la funzione
+def remove_alert_route():
     data = request.get_json()
     if not all(k in data for k in ["device_id", "exchange", "symbol"]):
         return jsonify({"error": "missing fields"}), 400
@@ -239,36 +287,31 @@ def open_trade():
         return "Missing parameters", 400
 
     user_agent = request.headers.get('User-Agent', '').lower()
-
-    # Rileva se è mobile
-    is_mobile = any(keyword in user_agent for keyword in ['mobile', 'android', 'iphone', 'ipad', 'windows phone'])
+    is_mobile = any(k in user_agent for k in ['mobile', 'android', 'iphone', 'ipad', 'windows phone'])
 
     if exchange == "binance":
-        web_url = f"https://www.binance.com/en/trade/{symbol.replace('USDT', '_USDT')}"  # Formato per Binance (es. BTC_USDT)
-        app_scheme = f"binance://app?route=trade/spot&symbol={symbol}"  # Deep link per Binance app (verifica/testa)
+        web_url = f"https://www.binance.com/en/futures/{symbol}"
+        app_scheme = f"binance://futures/trade?symbol={symbol}"  # Testa questo deep link
     elif exchange == "bybit":
-        web_url = f"https://www.bybit.com/trade/usdt/{symbol}"  # Formato per Bybit (es. BTCUSDT)
-        app_scheme = f"bybit://trade/usdt/{symbol}"  # Deep link ipotetico per Bybit (verifica/testa)
+        web_url = f"https://www.bybit.com/trade/usdt/{symbol}"
+        app_scheme = f"bybit://trade/usdt/{symbol}"  # Testa questo deep link
     else:
         return "Unsupported exchange", 400
 
     if is_mobile:
-        # Prova ad aprire l'app, con fallback al web (usa un JS semplice per timeout)
         return f"""
-        <html>
-        <body>
-        <script>
+        <html><body><script>
             window.location = "{app_scheme}";
-            setTimeout(function() {{ window.location = "{web_url}"; }}, 2000);  // Fallback al web dopo 2 secondi
-        </script>
-        </body>
-        </html>
+            setTimeout(() => {{ window.location = "{web_url}"; }}, 2000);
+        </script></body></html>
         """
     else:
         return redirect(web_url)
 
 if __name__ == "__main__":
-    # Avvia WS in thread
+    # Thread per check alert ogni 2 secondi
+    threading.Thread(target=alert_checker_thread, daemon=True).start()
+    # WebSocket threads
     threading.Thread(target=bybit_ws_thread, daemon=True).start()
     threading.Thread(target=binance_ws_thread, daemon=True).start()
     # Flask
