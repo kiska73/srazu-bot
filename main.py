@@ -9,9 +9,8 @@ from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 import time
 
-# ===============================
 # CONFIG
-# ===============================
+
 DB_PATH = "alerts.db"
 PORT = int(os.environ.get("PORT", 5000))
 
