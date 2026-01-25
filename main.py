@@ -5,14 +5,14 @@ import sqlite3
 from datetime import datetime
 import websocket
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
+import time  # Aggiunto per il sleep nel reconnect
 
 # ===============================
 # CONFIG
 # ===============================
 DB_PATH = "alerts.db"
 PORT = int(os.environ.get("PORT", 5000))
-
 # Prezzi in RAM + prev_price per cross
 prices = {"bybit": {}, "binance": {}}
 prev_prices = {"bybit": {}, "binance": {}}
@@ -86,9 +86,20 @@ def mark_triggered(alert_id):
 # ===============================
 # TELEGRAM
 # ===============================
-def send_telegram(bot_token, chat_id, message):
+def send_telegram(bot_token, chat_id, message, exchange, symbol):
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    trade_url = f"http://your-server-domain.com:{PORT}/open_trade?exchange={exchange}&symbol={symbol}"  # Sostituisci con il tuo dominio/IP e porta
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "Open Trade Now", "url": trade_url}
+        ]]
+    }
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "reply_markup": keyboard
+    }
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
@@ -106,16 +117,15 @@ def check_all_alerts():
             continue
         current_price = prices[exchange][symbol]
         prev_price = prev_prices[exchange].get(symbol, current_price)
-
         triggered = False
         if (prev_price < target_price <= current_price) or (prev_price > target_price >= current_price):
             triggered = True
 
         if triggered:
-            message = f"🚨 <b>ALERT {exchange.upper()} {symbol}</b>\nPrice reached: <b>{current_price:.8f}</b>\nTarget: <b>{target_price:.8f}</b>"
+            message = f" <b>ALERT {exchange.upper()} {symbol}</b>\nPrice reached: <b>{current_price:.8f}</b>\nTarget: <b>{target_price:.8f}</b>"
             if horiz_price is not None:
                 message += f"\nSynchronized line: <b>{horiz_price:.8f}</b>"
-            send_telegram(bot_token, chat_id, message)
+            send_telegram(bot_token, chat_id, message, exchange, symbol)
             mark_triggered(alert_id)
             print(f"[TRIGGERED] {device_id} {exchange} {symbol} at {current_price}")
 
@@ -210,7 +220,7 @@ def update_alert():
     return jsonify({"status": "updated"})
 
 @app.post("/remove_alert")
-def remove_alert():
+def remove_alert_route():  # Rinominato per evitare conflitto con la funzione
     data = request.get_json()
     if not all(k in data for k in ["device_id", "exchange", "symbol"]):
         return jsonify({"error": "missing fields"}), 400
@@ -221,10 +231,45 @@ def remove_alert():
 def health():
     return "Server alive"
 
+@app.get("/open_trade")
+def open_trade():
+    exchange = request.args.get("exchange")
+    symbol = request.args.get("symbol")
+    if not exchange or not symbol:
+        return "Missing parameters", 400
+
+    user_agent = request.headers.get('User-Agent', '').lower()
+
+    # Rileva se è mobile
+    is_mobile = any(keyword in user_agent for keyword in ['mobile', 'android', 'iphone', 'ipad', 'windows phone'])
+
+    if exchange == "binance":
+        web_url = f"https://www.binance.com/en/trade/{symbol.replace('USDT', '_USDT')}"  # Formato per Binance (es. BTC_USDT)
+        app_scheme = f"binance://app?route=trade/spot&symbol={symbol}"  # Deep link per Binance app (verifica/testa)
+    elif exchange == "bybit":
+        web_url = f"https://www.bybit.com/trade/usdt/{symbol}"  # Formato per Bybit (es. BTCUSDT)
+        app_scheme = f"bybit://trade/usdt/{symbol}"  # Deep link ipotetico per Bybit (verifica/testa)
+    else:
+        return "Unsupported exchange", 400
+
+    if is_mobile:
+        # Prova ad aprire l'app, con fallback al web (usa un JS semplice per timeout)
+        return f"""
+        <html>
+        <body>
+        <script>
+            window.location = "{app_scheme}";
+            setTimeout(function() {{ window.location = "{web_url}"; }}, 2000);  // Fallback al web dopo 2 secondi
+        </script>
+        </body>
+        </html>
+        """
+    else:
+        return redirect(web_url)
+
 if __name__ == "__main__":
     # Avvia WS in thread
     threading.Thread(target=bybit_ws_thread, daemon=True).start()
     threading.Thread(target=binance_ws_thread, daemon=True).start()
-
     # Flask
     app.run(host="0.0.0.0", port=PORT)
