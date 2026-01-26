@@ -9,8 +9,9 @@ from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 import time
 
+# ===============================
 # CONFIG
-
+# ===============================
 DB_PATH = "alerts.db"
 PORT = int(os.environ.get("PORT", 5000))
 
@@ -290,10 +291,10 @@ def open_trade():
 
     if exchange == "binance":
         web_url = f"https://www.binance.com/en/futures/{symbol}"
-        app_scheme = f"binance://futures/trade?symbol={symbol}"  # Testa questo deep link
+        app_scheme = f"binance://futures/trade?symbol={symbol}"  # Deep link per app Binance
     elif exchange == "bybit":
         web_url = f"https://www.bybit.com/trade/usdt/{symbol}"
-        app_scheme = f"bybit://trade/usdt/{symbol}"  # Testa questo deep link
+        app_scheme = f"bybit://trade/usdt/{symbol}"  # Deep link per app Bybit
     else:
         return "Unsupported exchange", 400
 
