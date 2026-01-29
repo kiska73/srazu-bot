@@ -12,18 +12,23 @@ import time
 # ===============================
 # CONFIG
 # ===============================
-DB_PATH = "alerts.db"
+# Usa il disco persistente di Render (mount path /data)
+DB_PATH = "/data/alerts.db"
+
 PORT = int(os.environ.get("PORT", 5000))
 
 # Prezzi in RAM + prev_price per cross detection
 prices = {"bybit": {}, "binance": {}}
 prev_prices = {"bybit": {}, "binance": {}}
 
-# WebSocket global per Bybit (per subscribe dinamiche)
+# WebSocket global per Bybit
 bybit_ws = None
 
-# Dominio del tuo server Render (sostituisci se cambia)
-SERVER_DOMAIN = "https://srazu-bot.onrender.com"
+# Set dei symbol attualmente sottoscritti su Bybit (per gestione dinamica subscribe/unsubscribe)
+subscribed_bybit_symbols = set()
+
+# Dominio del tuo server Render (puoi anche impostarlo come env var su Render)
+SERVER_DOMAIN = os.environ.get("SERVER_DOMAIN", "https://srazu-bot.onrender.com")
 
 # ===============================
 # DATABASE
@@ -68,9 +73,9 @@ def upsert_alert(data):
     conn.commit()
     conn.close()
 
-    # Subscribe dinamica per Bybit se necessario
+    # Gestisci subscription Bybit dopo aggiunta/aggiornamento
     if data['exchange'] == "bybit":
-        subscribe_bybit_symbol(data['symbol'])
+        refresh_bybit_subscriptions()
 
 def remove_alert(device_id, exchange, symbol):
     conn = sqlite3.connect(DB_PATH)
@@ -79,6 +84,9 @@ def remove_alert(device_id, exchange, symbol):
               (device_id, exchange, symbol))
     conn.commit()
     conn.close()
+
+    if exchange == "bybit":
+        refresh_bybit_subscriptions()
 
 def get_active_alerts():
     conn = sqlite3.connect(DB_PATH)
@@ -96,17 +104,40 @@ def mark_triggered(alert_id):
     conn.close()
 
 # ===============================
-# BYBIT SUBSCRIBE DINAMICA
+# BYBIT SUBSCRIBE / UNSUBSCRIBE
 # ===============================
-def subscribe_bybit_symbol(symbol):
-    global bybit_ws
-    if bybit_ws:
+def refresh_bybit_subscriptions():
+    global bybit_ws, subscribed_bybit_symbols
+    if not bybit_ws:
+        return
+
+    # Calcola i symbol attivi per Bybit
+    alerts = get_active_alerts()
+    desired_symbols = {row[5] for row in alerts if row[4] == "bybit"}
+
+    # Da sottoscrivere
+    to_subscribe = desired_symbols - subscribed_bybit_symbols
+    # Da rimuovere
+    to_unsubscribe = subscribed_bybit_symbols - desired_symbols
+
+    for sym in to_subscribe:
+        msg = json.dumps({"op": "subscribe", "args": [f"tickers.{sym}"]})
         try:
-            msg = json.dumps({"op": "subscribe", "args": [f"tickers.{symbol}"]})
             bybit_ws.send(msg)
-            print(f"[BYBIT] Subscribed to new symbol: {symbol}")
+            print(f"[BYBIT] Subscribed to {sym}")
         except Exception as e:
-            print(f"[BYBIT] Subscribe error: {e}")
+            print(f"[BYBIT] Subscribe error {sym}: {e}")
+
+    for sym in to_unsubscribe:
+        msg = json.dumps({"op": "unsubscribe", "args": [f"tickers.{sym}"]})
+        try:
+            bybit_ws.send(msg)
+            print(f"[BYBIT] Unsubscribed from {sym}")
+        except Exception as e:
+            print(f"[BYBIT] Unsubscribe error {sym}: {e}")
+
+    # Aggiorna il set
+    subscribed_bybit_symbols = desired_symbols
 
 # ===============================
 # TELEGRAM
@@ -155,7 +186,11 @@ def check_all_alerts():
             mark_triggered(alert_id)
             print(f"[TRIGGERED] {device_id} {exchange} {symbol} at {current_price}")
 
-        # Aggiorna prev_price per il prossimo check
+            # Dopo trigger, refresh subscription (l'alert non è più active)
+            if exchange == "bybit":
+                refresh_bybit_subscriptions()
+
+        # Aggiorna prev_price
         prev_prices[exchange][symbol] = current_price
 
 # Thread che forza il check ogni 2 secondi
@@ -168,19 +203,15 @@ def alert_checker_thread():
 # WEBSOCKET BYBIT (V5)
 # ===============================
 def bybit_ws_thread():
-    global bybit_ws
+    global bybit_ws, subscribed_bybit_symbols
     url = "wss://stream.bybit.com/v5/public/linear"
 
     def on_open(ws):
-        global bybit_ws
+        global bybit_ws, subscribed_bybit_symbols
         bybit_ws = ws
+        subscribed_bybit_symbols = set()  # reset
         print("[BYBIT] Connected")
-        # Sottoscrivi tutti i symbol attivi all'avvio
-        alerts = get_active_alerts()
-        symbols = {row[5] for row in alerts if row[4] == "bybit"}
-        for sym in symbols:
-            ws.send(json.dumps({"op": "subscribe", "args": [f"tickers.{sym}"]}))
-            print(f"[BYBIT] Subscribed to {sym}")
+        refresh_bybit_subscriptions()  # sottoscrivi tutti gli active all'avvio
 
     def on_message(ws, message):
         try:
@@ -192,7 +223,7 @@ def bybit_ws_thread():
                     price = float(price_data.get("lastPrice", 0))
                     if price > 0:
                         prices["bybit"][symbol] = price
-                        check_all_alerts()
+                        # check_all_alerts() viene chiamato dal thread separato ogni 2s
         except Exception as e:
             print(f"[BYBIT MSG ERROR] {e}")
 
@@ -227,7 +258,7 @@ def binance_ws_thread():
                 if symbol.endswith("USDT"):
                     price = float(ticker["c"])
                     prices["binance"][symbol] = price
-                    check_all_alerts()
+                    # check_all_alerts() dal thread separato
         except Exception as e:
             print(f"[BINANCE MSG ERROR] {e}")
 
@@ -247,7 +278,8 @@ def binance_ws_thread():
 # FLASK APP
 # ===============================
 app = Flask(__name__)
-CORS(app)  # Permette tutte le origini (per test). Per produzione: CORS(app, origins=["https://srazu.vercel.app"])
+# CORS per produzione: solo il tuo dominio Vercel
+CORS(app974, origins=["https://srazu.vercel.app"])
 
 @app.post("/add_alert")
 def add_alert():
@@ -279,6 +311,19 @@ def remove_alert_route():
 def health():
     return "Server alive"
 
+# Endpoint debug (rimuovilo in produzione o proteggi con password)
+@app.get("/list_alerts")
+def list_alerts():
+    alerts = get_active_alerts()
+    return jsonify([{
+        "id": a[0],
+        "device_id": a[1],
+        "exchange": a[4],
+        "symbol": a[5],
+        "target_price": a[6],
+        "horiz_price": a[7]
+    } for a in alerts])
+
 @app.get("/open_trade")
 def open_trade():
     exchange = request.args.get("exchange")
@@ -291,10 +336,10 @@ def open_trade():
 
     if exchange == "binance":
         web_url = f"https://www.binance.com/en/futures/{symbol}"
-        app_scheme = f"binance://futures/trade?symbol={symbol}"  # Deep link per app Binance
+        app_scheme = f"binance://futures/trade?symbol={symbol}"
     elif exchange == "bybit":
         web_url = f"https://www.bybit.com/trade/usdt/{symbol}"
-        app_scheme = f"bybit://trade/usdt/{symbol}"  # Deep link per app Bybit
+        app_scheme = f"bybit://trade/usdt/{symbol}"
     else:
         return "Unsupported exchange", 400
 
