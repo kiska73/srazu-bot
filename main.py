@@ -13,8 +13,12 @@ import time
 # CONFIG
 # ===============================
 # Usa il disco persistente di Render (mount path /data)
-DB_PATH = "/data/alerts.db"
+#import os
 
+import os
+
+# All'inizio del file
+#DB_PATH = os.path.join(os.environ.get("RENDER_DISK", "/data"), "alerts.db") if os.environ.get("RENDER_DISK") else "alerts.db"
 PORT = int(os.environ.get("PORT", 5000))
 
 # Prezzi in RAM + prev_price per cross detection
