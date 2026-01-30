@@ -1,12 +1,11 @@
 import os
-import json
 import sqlite3
-from datetime import datetime
-import requests
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 
-DB_PATH = "alerts.db"
+# --- CONFIGURAZIONE DISCO PERSISTENTE ---
+# Assicurati che su Render il "Mount Path" del disco sia: /data
+DB_PATH = "/data/alerts.db"
 PORT = int(os.environ.get("PORT", 5000))
 SERVER_DOMAIN = "https://srazu-bot.onrender.com"
 
@@ -14,6 +13,11 @@ SERVER_DOMAIN = "https://srazu-bot.onrender.com"
 # DATABASE
 # ===============================
 def init_db():
+    # Crea la cartella data se non esiste (utile per test locali)
+    directory = os.path.dirname(DB_PATH)
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+        
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS alerts (
