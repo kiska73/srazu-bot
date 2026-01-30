@@ -12,14 +12,12 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS alerts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        device_id TEXT NOT NULL,
-        bot_token TEXT NOT NULL,
-        chat_id TEXT NOT NULL,
-        exchange TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        target_price REAL NOT NULL,
-        horiz_price REAL,
-        condition TEXT DEFAULT 'cross',
+        device_id TEXT,
+        bot_token TEXT,
+        chat_id TEXT,
+        exchange TEXT,
+        symbol TEXT,
+        target_price REAL,
         status TEXT DEFAULT 'active',
         triggered_at TIMESTAMP,
         UNIQUE(device_id, exchange, symbol)
@@ -28,41 +26,30 @@ def init_db():
     conn.close()
 
 init_db()
-
 app = Flask(__name__)
 CORS(app)
 
-@app.get("/")
-def health():
-    return "Bot Online. Vai su /view_alerts"
-
-@app.get("/view_alerts")
-def view_alerts():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT exchange, symbol, target_price, status FROM alerts ORDER BY id DESC")
-    rows = c.fetchall()
-    conn.close()
-    res = "<h1>Alert Attivi</h1>"
-    for r in rows:
-        res += f"<p>{r[0].upper()} - {r[1]}: <b>{r[2]}</b> ({r[3]})</p>"
-    return res
+@app.route("/")
+def health(): return "Srazu Bot Online"
 
 @app.post("/add_alert")
 def add_alert():
     data = request.get_json()
-    symbol = data['symbol'].upper().strip() # Pulizia nome
+    sy = data['symbol'].upper().strip()
+    ex = data['exchange'].lower().strip()
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # Eliminiamo vecchi alert per la stessa coppia per sicurezza
+    c.execute("DELETE FROM alerts WHERE device_id=? AND exchange=? AND symbol=?", (data['device_id'], ex, sy))
+    # Inseriamo il nuovo alert come 'active'
     c.execute("""
         INSERT INTO alerts (device_id, bot_token, chat_id, exchange, symbol, target_price, status)
         VALUES (?, ?, ?, ?, ?, ?, 'active')
-        ON CONFLICT(device_id, exchange, symbol) DO UPDATE SET
-            target_price=excluded.target_price, status='active', triggered_at=NULL
-    """, (data['device_id'], data['bot_token'], data['chat_id'], data['exchange'].lower(), symbol, data['target_price']))
+    """, (data['device_id'], data['bot_token'], data['chat_id'], ex, sy, data['target_price']))
     conn.commit()
     conn.close()
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "msg": f"Alert {sy} attivato"})
 
 @app.get("/open_trade")
 def open_trade():
