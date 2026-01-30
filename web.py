@@ -3,21 +3,13 @@ import sqlite3
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 
-# --- CONFIGURAZIONE DISCO PERSISTENTE ---
-# Assicurati che su Render il "Mount Path" del disco sia: /data
+# Il percorso punta al disco persistente di Render
 DB_PATH = "/data/alerts.db"
-PORT = int(os.environ.get("PORT", 5000))
+PORT = int(os.environ.get("PORT", 10000))
 SERVER_DOMAIN = "https://srazu-bot.onrender.com"
 
-# ===============================
-# DATABASE
-# ===============================
 def init_db():
-    # Crea la cartella data se non esiste (utile per test locali)
-    directory = os.path.dirname(DB_PATH)
-    if directory and not os.path.exists(directory):
-        os.makedirs(directory, exist_ok=True)
-        
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS alerts (
@@ -39,107 +31,62 @@ def init_db():
 
 init_db()
 
-def upsert_alert(data):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO alerts 
-        (device_id, bot_token, chat_id, exchange, symbol, target_price, horiz_price, condition, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
-        ON CONFLICT(device_id, exchange, symbol) DO UPDATE SET
-            target_price=excluded.target_price,
-            horiz_price=excluded.horiz_price,
-            bot_token=excluded.bot_token,
-            chat_id=excluded.chat_id,
-            status='active',
-            triggered_at=NULL
-    """, (
-        data['device_id'],
-        data['bot_token'],
-        data['chat_id'],
-        data['exchange'],
-        data['symbol'],
-        data['target_price'],
-        data.get('horiz_price'),
-        data.get('condition', 'cross')
-    ))
-    conn.commit()
-    conn.close()
-
-def remove_alert(device_id, exchange, symbol):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        UPDATE alerts SET status='cancelled'
-        WHERE device_id=? AND exchange=? AND symbol=?
-    """, (device_id, exchange, symbol))
-    conn.commit()
-    conn.close()
-
-# ===============================
-# FLASK
-# ===============================
 app = Flask(__name__)
 CORS(app)
+
+@app.get("/")
+def health():
+    return f"Server Online. Controlla gli alert su: {SERVER_DOMAIN}/view_alerts"
+
+@app.get("/view_alerts")
+def view_alerts():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT device_id, exchange, symbol, target_price, status, triggered_at FROM alerts ORDER BY id DESC")
+        rows = c.fetchall()
+        conn.close()
+        
+        html = "<html><head><style>table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background-color:#f2f2f2}</style></head><body>"
+        html += "<h1>Alert nel Database</h1><table><tr><th>Device</th><th>Exchange</th><th>Symbol</th><th>Target</th><th>Status</th><th>Data Trigger</th></tr>"
+        for r in rows:
+            html += f"<tr><td>{r[0]}</td><td>{r[1]}</td><td>{r[2]}</td><td>{r[3]}</td><td>{r[4]}</td><td>{r[5] if r[5] else '-'}</td></tr>"
+        html += "</table><p><a href='/'>Indietro</a></p></body></html>"
+        return html
+    except Exception as e:
+        return f"Errore lettura DB: {str(e)}"
 
 @app.post("/add_alert")
 def add_alert():
     data = request.get_json()
-    required = ["device_id", "bot_token", "chat_id", "exchange", "symbol", "target_price"]
-    if not all(k in data for k in required):
-        return jsonify({"error": "missing fields"}), 400
-    upsert_alert(data)
-    return jsonify({"status": "added"})
-
-@app.post("/update_alert")
-def update_alert():
-    data = request.get_json()
-    required = ["device_id", "bot_token", "chat_id", "exchange", "symbol", "target_price"]
-    if not all(k in data for k in required):
-        return jsonify({"error": "missing fields"}), 400
-    upsert_alert(data)
-    return jsonify({"status": "updated"})
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO alerts (device_id, bot_token, chat_id, exchange, symbol, target_price, horiz_price, condition, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
+        ON CONFLICT(device_id, exchange, symbol) DO UPDATE SET
+            target_price=excluded.target_price, bot_token=excluded.bot_token, chat_id=excluded.chat_id, status='active', triggered_at=NULL
+    """, (data['device_id'], data['bot_token'], data['chat_id'], data['exchange'], data['symbol'], data['target_price'], data.get('horiz_price'), data.get('condition', 'cross')))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok"})
 
 @app.post("/remove_alert")
-def remove_alert_route():
+def remove_alert():
     data = request.get_json()
-    if not all(k in data for k in ["device_id", "exchange", "symbol"]):
-        return jsonify({"error": "missing fields"}), 400
-    remove_alert(data["device_id"], data["exchange"], data["symbol"])
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM alerts WHERE device_id=? AND exchange=? AND symbol=?", (data["device_id"], data["exchange"], data["symbol"]))
+    conn.commit()
+    conn.close()
     return jsonify({"status": "removed"})
-
-@app.get("/")
-def health():
-    return "Server alive"
 
 @app.get("/open_trade")
 def open_trade():
-    exchange = request.args.get("exchange")
-    symbol = request.args.get("symbol")
-    if not exchange or not symbol:
-        return "Missing parameters", 400
-
-    user_agent = request.headers.get('User-Agent', '').lower()
-    is_mobile = any(k in user_agent for k in ['mobile', 'android', 'iphone', 'ipad', 'windows phone'])
-
-    if exchange == "binance":
-        web_url = f"https://www.binance.com/en/futures/{symbol}"
-        app_scheme = f"binance://futures/trade?symbol={symbol}"
-    elif exchange == "bybit":
-        web_url = f"https://www.bybit.com/trade/usdt/{symbol}"
-        app_scheme = f"bybit://trade/usdt/{symbol}"
-    else:
-        return "Unsupported exchange", 400
-
-    if is_mobile:
-        return f"""
-        <html><body><script>
-            window.location = "{app_scheme}";
-            setTimeout(() => {{ window.location = "{web_url}"; }}, 2000);
-        </script></body></html>
-        """
-    else:
-        return redirect(web_url)
+    ex, sy = request.args.get("exchange"), request.args.get("symbol")
+    if ex == "binance": url = f"https://www.binance.com/en/futures/{sy}"
+    else: url = f"https://www.bybit.com/trade/usdt/{sy}"
+    return redirect(url)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
