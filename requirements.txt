@@ -1,4 +1,5 @@
 flask
 flask-cors
-websocket-client
 requests
+websocket-client
+gunicorn
