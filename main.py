@@ -12,10 +12,9 @@ import time
 # ===============================
 # CONFIG
 # ===============================
-DB_PATH = os.environ.get("DB_PATH", "/data/alerts.db")  # Usa il disco persistente
+DB_PATH = os.environ.get("DB_PATH", "/data/alerts.db")  # Disco persistente
 PORT = int(os.environ.get("PORT", 5000))
 
-# Cambia con il tuo dominio Render (o imposta env SERVER_DOMAIN)
 SERVER_DOMAIN = os.environ.get("SERVER_DOMAIN", "https://srazu-bot.onrender.com")
 
 # Prezzi in RAM + prev_price per cross detection
@@ -24,6 +23,7 @@ prev_prices = {"bybit": {}, "binance": {}}
 
 # WebSocket global
 bybit_ws = None
+binance_ws = None
 
 # ===============================
 # DATABASE
@@ -48,6 +48,13 @@ def init_db():
     conn.commit()
     conn.close()
     print(f"[DB] Inizializzato su {DB_PATH}")
+    
+    # DEBUG DISK
+    print(f"[DISK] /data esiste? {os.path.exists('/data')}")
+    if os.path.exists('/data'):
+        print(f"[DISK] Contenuti /data: {os.listdir('/data')}")
+        if os.path.exists(DB_PATH):
+            print(f"[DISK] alerts.db size: {os.path.getsize(DB_PATH)} bytes")
 
 init_db()
 
@@ -140,6 +147,8 @@ def check_all_alerts():
     if not alerts:
         return
 
+    updated_symbols = set()
+
     for alert in alerts:
         alert_id, device_id, bot_token, chat_id, exchange, symbol, target_price, horiz_price = alert
         target_price = float(target_price)
@@ -149,7 +158,6 @@ def check_all_alerts():
         current_price = prices[exchange][symbol]
         prev_price = prev_prices[exchange].get(symbol, current_price)
 
-        # Cross detection
         triggered = (prev_price < target_price <= current_price) or (prev_price > target_price >= current_price)
 
         if triggered:
@@ -160,20 +168,23 @@ def check_all_alerts():
             mark_triggered(alert_id)
             print(f"[{datetime.now()}] [TRIGGERED] {device_id} {exchange} {symbol} @ {current_price}")
 
-        # Aggiorna prev_price
-        prev_prices[exchange][symbol] = current_price
+        updated_symbols.add((exchange, symbol))
+
+    # Aggiorna prev_price dopo tutto il loop
+    for exchange, symbol in updated_symbols:
+        prev_prices[exchange][symbol] = prices[exchange][symbol]
 
 # ===============================
-# BYBIT WEBSOCKET + PING
+# BYBIT WEBSOCKET
 # ===============================
 def bybit_ping_thread():
     while True:
-        time.sleep(15)
+        time.sleep(20)  # Bybit raccomanda ogni 20-30 sec
         global bybit_ws
         if bybit_ws and bybit_ws.sock and bybit_ws.sock.connected:
             try:
                 bybit_ws.send(json.dumps({"op": "ping"}))
-                print(f"[{datetime.now()}] [BYBIT] Ping sent")
+                # Rimossi i print spam, solo se vuoi debug: print(f"[{datetime.now()}] [BYBIT] Ping sent")
             except:
                 pass
 
@@ -190,6 +201,7 @@ def bybit_ws_thread():
         for sym in symbols:
             ws.send(json.dumps({"op": "subscribe", "args": [f"tickers.{sym}"]}))
             print(f"[BYBIT] Subscribed to {sym}")
+        print(f"[{datetime.now()}] [BYBIT] Totale subscribed: {len(symbols)} simboli")
 
     def on_message(ws, message):
         try:
@@ -202,6 +214,7 @@ def bybit_ws_thread():
                     if price_str:
                         price = float(price_str)
                         if price > 0:
+                            print(f"[{datetime.now()}] [BYBIT UPDATE] {symbol} @ {price:.8f}")
                             prices["bybit"][symbol] = price
                             check_all_alerts()
         except Exception as e:
@@ -213,7 +226,7 @@ def bybit_ws_thread():
     def on_close(ws, *args):
         global bybit_ws
         bybit_ws = None
-        print(f"[{datetime.now()}] [BYBIT] Closed → reconnecting...")
+        print(f"[{datetime.now()}] [BYBIT] Closed → reconnecting in 5s...")
         time.sleep(5)
         bybit_ws_thread()
 
@@ -225,15 +238,19 @@ def bybit_ws_thread():
 # BINANCE WEBSOCKET
 # ===============================
 def binance_ws_thread():
+    global binance_ws
     url = "wss://fstream.binance.com/ws/!ticker@arr"
 
     def on_open(ws):
-        print(f"[{datetime.now()}] [BINANCE] Connected")
+        global binance_ws
+        binance_ws = ws
+        print(f"[{datetime.now()}] [BINANCE] Connected (all tickers)")
 
     def on_message(ws, message):
         try:
             data = json.loads(message)
             if isinstance(data, list):
+                updates = 0
                 for ticker in data:
                     symbol = ticker.get("s")
                     if symbol and symbol.endswith("USDT"):
@@ -241,7 +258,10 @@ def binance_ws_thread():
                         if price_str:
                             price = float(price_str)
                             prices["binance"][symbol] = price
-                check_all_alerts()  # Una sola volta dopo tutti gli aggiornamenti
+                            updates += 1
+                if updates > 0:
+                    print(f"[{datetime.now()}] [BINANCE UPDATE] Ricevuti {updates} aggiornamenti prezzi")
+                check_all_alerts()
         except Exception as e:
             print(f"[BINANCE MSG ERROR] {e}")
 
@@ -249,7 +269,9 @@ def binance_ws_thread():
         print(f"[{datetime.now()}] [BINANCE ERROR] {error}")
 
     def on_close(ws, *args):
-        print(f"[{datetime.now()}] [BINANCE] Closed → reconnecting...")
+        global binance_ws
+        binance_ws = None
+        print(f"[{datetime.now()}] [BINANCE] Closed → reconnecting in 5s...")
         time.sleep(5)
         binance_ws_thread()
 
@@ -258,10 +280,28 @@ def binance_ws_thread():
     ws.run_forever(ping_interval=20, ping_timeout=10)
 
 # ===============================
+# MONITOR THREAD (per vedere se è vivo)
+# ===============================
+def monitor_thread():
+    last_update = datetime.now()
+    while True:
+        time.sleep(60)
+        bybit_conn = bybit_ws.sock.connected if bybit_ws and bybit_ws.sock else False
+        binance_conn = binance_ws.sock.connected if binance_ws and binance_ws.sock else False
+        bybit_symbols = len(prices["bybit"])
+        binance_symbols = len(prices["binance"])
+        now = datetime.now()
+        print(f"[{now}] [MONITOR] Bybit WS: {bybit_conn} | Simboli: {bybit_symbols} | Binance WS: {binance_conn} | Simboli: {binance_symbols} | Ultimo update: {(now - last_update).seconds}s fa")
+        # Resetta solo se ci sono stati update recenti (opzionale)
+        # last_update = now se hai update
+
+threading.Thread(target=monitor_thread, daemon=True).start()
+
+# ===============================
 # FLASK APP
 # ===============================
 app = Flask(__name__)
-CORS(app, origins=["*"])  # Cambia con il tuo dominio frontend in produzione
+CORS(app, origins=["*"])
 
 @app.post("/add_alert")
 def add_alert():
@@ -329,5 +369,4 @@ if __name__ == "__main__":
     threading.Thread(target=bybit_ws_thread, daemon=True).start()
     threading.Thread(target=binance_ws_thread, daemon=True).start()
 
-    # Flask (su Render usa gunicorn automaticamente se presente)
     app.run(host="0.0.0.0", port=PORT)
