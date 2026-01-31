@@ -3,7 +3,6 @@ import json
 import threading
 import sqlite3
 from datetime import datetime
-import websocket
 import requests
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
@@ -21,12 +20,8 @@ SERVER_DOMAIN = os.environ.get("SERVER_DOMAIN", "https://srazu-bot.onrender.com"
 prices = {"bybit": {}, "binance": {}}
 prev_prices = {"bybit": {}, "binance": {}}
 
-# WebSocket global
-bybit_ws = None
-# Binance disabilitato (commentato tutto il thread e funzioni relative)
-
-# Ultimo update prezzi (per monitor)
-last_price_update = datetime.now()
+# Polling interval in seconds
+POLL_INTERVAL = 5  # Ogni 5 secondi, controlla prezzi solo per simboli attivi
 
 # ===============================
 # DATABASE
@@ -78,9 +73,7 @@ def upsert_alert(data):
                data['symbol'], data['target_price'], data.get('horiz_price'), data.get('condition', 'cross')))
     conn.commit()
     conn.close()
-
-    if data['exchange'] == "bybit":
-        subscribe_bybit_symbol(data['symbol'])
+    print(f"[ALERT] Upsert alert: {data['exchange']} {data['symbol']} for {data['device_id']}")
 
 def remove_alert(device_id, exchange, symbol):
     conn = sqlite3.connect(DB_PATH)
@@ -98,19 +91,6 @@ def get_active_alerts():
     alerts = c.fetchall()
     conn.close()
     return alerts
-
-# ===============================
-# BYBIT SUBSCRIBE
-# ===============================
-def subscribe_bybit_symbol(symbol):
-    global bybit_ws
-    if bybit_ws and bybit_ws.sock and bybit_ws.sock.connected:
-        try:
-            msg = json.dumps({"op": "subscribe", "args": [f"tickers.{symbol}"]})
-            bybit_ws.send(msg)
-            print(f"[BYBIT] Subscribed to {symbol}")
-        except Exception as e:
-            print(f"[BYBIT] Subscribe error: {e}")
 
 # ===============================
 # TELEGRAM
@@ -139,12 +119,7 @@ def send_telegram(bot_token, chat_id, message, exchange, symbol):
 # ===============================
 # ALERT CHECK
 # ===============================
-def check_all_alerts():
-    global last_price_update
-    alerts = get_active_alerts()
-    if not alerts:
-        return
-
+def check_all_alerts(alerts):
     updated_symbols = set()
 
     for alert in alerts:
@@ -156,7 +131,7 @@ def check_all_alerts():
         current_price = prices[exchange][symbol]
         prev_price = prev_prices[exchange].get(symbol, current_price)
 
-        # Cross detection
+        # Cross detection bidirezionale: triggera se crossa up o down
         triggered = (prev_price < target_price <= current_price) or (prev_price > target_price >= current_price)
 
         if triggered:
@@ -165,7 +140,7 @@ def check_all_alerts():
                 message += f"\nSynchronized line: <b>{horiz_price:.8f}</b>"
             message += f"\n\n⚠️ Alert triggered and cancelled automatically."
             send_telegram(bot_token, chat_id, message, exchange, symbol)
-            remove_alert(device_id, exchange, symbol)  # Cancellazione automatica
+            remove_alert(device_id, exchange, symbol)
             print(f"[{datetime.now()}] [TRIGGERED & CANCELLED] {device_id} {exchange} {symbol} @ {current_price}")
 
         updated_symbols.add((exchange, symbol))
@@ -175,79 +150,61 @@ def check_all_alerts():
         prev_prices[exchange][symbol] = prices[exchange][symbol]
 
 # ===============================
-# BYBIT WEBSOCKET + PING
+# POLLING THREAD (REST API)
 # ===============================
-def bybit_ping_thread():
+def polling_thread():
     while True:
-        time.sleep(20)
-        global bybit_ws
-        if bybit_ws and bybit_ws.sock and bybit_ws.sock.connected:
-            try:
-                bybit_ws.send(json.dumps({"op": "ping"}))
-            except:
-                pass
-
-def bybit_ws_thread():
-    global bybit_ws
-    url = "wss://stream.bybit.com/v5/public/linear"
-
-    def on_open(ws):
-        global bybit_ws
-        bybit_ws = ws
-        print(f"[{datetime.now()}] [BYBIT] Connected")
         alerts = get_active_alerts()
-        symbols = {row[5] for row in alerts if row[4] == "bybit"}
-        for sym in symbols:
-            ws.send(json.dumps({"op": "subscribe", "args": [f"tickers.{sym}"]}))
-            print(f"[BYBIT] Subscribed to {sym}")
-        print(f"[{datetime.now()}] [BYBIT] Totale subscribed: {len(symbols)} simboli")
+        if not alerts:
+            print(f"[{datetime.now()}] [POLL] No active alerts - sleeping {POLL_INTERVAL}s")
+            time.sleep(POLL_INTERVAL)
+            continue
 
-    def on_message(ws, message):
-        global last_price_update
-        try:
-            data = json.loads(message)
-            if data.get("topic", "").startswith("tickers."):
-                symbol = data["topic"].split(".")[1]
-                price_data = data.get("data", {})
-                if isinstance(price_data, dict):
-                    price_str = price_data.get("lastPrice")
-                    if price_str:
+        # Raccogli simboli unici per exchange
+        bybit_symbols = set()
+        binance_symbols = set()
+        for alert in alerts:
+            exchange = alert[4]
+            symbol = alert[5]
+            if exchange == "bybit":
+                bybit_symbols.add(symbol)
+            elif exchange == "binance":
+                binance_symbols.add(symbol)
+
+        # Fetch Bybit - loop su singoli per non sovraccaricare (rate limit alto, ~200/min)
+        for symbol in bybit_symbols:
+            try:
+                url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}"
+                r = requests.get(url, timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                    if data['retCode'] == 0:
+                        price_str = data['result']['list'][0]['lastPrice']
                         price = float(price_str)
-                        if price > 0:
-                            prices["bybit"][symbol] = price
-                            last_price_update = datetime.now()
-                            check_all_alerts()
-                            # Log ridotto: print solo ogni 60 sec o su trigger (rimosso print spam)
-        except Exception as e:
-            print(f"[BYBIT MSG ERROR] {e}")
+                        prices["bybit"][symbol] = price
+                        print(f"[{datetime.now()}] [BYBIT POLL] {symbol} @ {price:.8f}")
+            except Exception as e:
+                print(f"[BYBIT POLL ERROR] {symbol}: {e}")
+            time.sleep(0.1)  # Piccolo delay se tanti simboli, per evitare throttle
 
-    def on_error(ws, error):
-        print(f"[{datetime.now()}] [BYBIT ERROR] {error}")
+        # Fetch Binance - loop su singoli
+        for symbol in binance_symbols:
+            try:
+                url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
+                r = requests.get(url, timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                    price = float(data['price'])
+                    prices["binance"][symbol] = price
+                    print(f"[{datetime.now()}] [BINANCE POLL] {symbol} @ {price:.8f}")
+            except Exception as e:
+                print(f"[BINANCE POLL ERROR] {symbol}: {e}")
+            time.sleep(0.1)  # Piccolo delay
 
-    def on_close(ws, *args):
-        global bybit_ws
-        bybit_ws = None
-        print(f"[{datetime.now()}] [BYBIT] Closed → reconnecting...")
-        time.sleep(5)
-        bybit_ws_thread()
+        # Check alerts dopo fetch
+        check_all_alerts(alerts)
 
-    ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message,
-                                on_error=on_error, on_close=on_close)
-    ws.run_forever(ping_timeout=10)
-
-# ===============================
-# MONITOR THREAD (per vedere se è vivo)
-# ===============================
-def monitor_thread():
-    while True:
-        time.sleep(60)
-        now = datetime.now()
-        bybit_conn = bybit_ws.sock.connected if bybit_ws and bybit_ws.sock else False
-        bybit_symbols = len(prices["bybit"])
-        seconds_since_update = (now - last_price_update).seconds
-        print(f"[{now}] [MONITOR] Bybit WS: {bybit_conn} | Simboli: {bybit_symbols} | Ultimo update: {seconds_since_update}s fa")
-
-threading.Thread(target=monitor_thread, daemon=True).start()
+        time.sleep(POLL_INTERVAL)
 
 # ===============================
 # FLASK APP
@@ -316,9 +273,7 @@ def open_trade():
         return redirect(web_url)
 
 if __name__ == "__main__":
-    # Thread
-    threading.Thread(target=bybit_ping_thread, daemon=True).start()
-    threading.Thread(target=bybit_ws_thread, daemon=True).start()
-    # Binance disabilitato
+    # Thread polling in background
+    threading.Thread(target=polling_thread, daemon=True).start()
 
     app.run(host="0.0.0.0", port=PORT)
