@@ -6,7 +6,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const ALERT_FILE = "./alerts.json";
+const ALERT_FILE = "/data/alerts.json";
 
 /* ---------------- FILE HELPERS ---------------- */
 
