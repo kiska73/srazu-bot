@@ -6,17 +6,28 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+
+/* ===== RENDER DISK ===== */
 const ALERT_FILE = "/data/alerts.json";
 
 /* ---------------- FILE HELPERS ---------------- */
 
 function loadAlerts() {
-    if (!fs.existsSync(ALERT_FILE)) return [];
-    return JSON.parse(fs.readFileSync(ALERT_FILE, "utf8"));
+    try {
+        if (!fs.existsSync(ALERT_FILE)) return [];
+        return JSON.parse(fs.readFileSync(ALERT_FILE, "utf8"));
+    } catch (e) {
+        console.error("Read alerts error:", e.message);
+        return [];
+    }
 }
 
 function saveAlerts(alerts) {
-    fs.writeFileSync(ALERT_FILE, JSON.stringify(alerts, null, 2));
+    try {
+        fs.writeFileSync(ALERT_FILE, JSON.stringify(alerts, null, 2));
+    } catch (e) {
+        console.error("Save alerts error:", e.message);
+    }
 }
 
 /* ---------------- PRICE FETCH ---------------- */
@@ -75,11 +86,18 @@ BODY:
   tgChatId
 }
 */
+
 app.post("/set_alert", (req, res) => {
     const alerts = loadAlerts();
 
     alerts.push({
-        ...req.body,
+        device_id: req.body.device_id,
+        exchange: req.body.exchange,
+        symbol: req.body.symbol,
+        price: Number(req.body.price),
+        direction: req.body.direction,
+        tgToken: req.body.tgToken,
+        tgChatId: req.body.tgChatId,
         triggered: false,
         created: Date.now()
     });
@@ -156,85 +174,3 @@ Current price: <b>${price}</b>
 app.listen(PORT, () => {
     console.log("Alert server running on port", PORT);
 });
-  let userAlerts = db.data.alerts[device_id] || [];
-  userAlerts = userAlerts.filter(a => a.symbol !== symbol);
-
-  db.data.alerts[device_id] = userAlerts;
-  await db.write();
-
-  console.log(`Alert rimosso per ${symbol}`);
-  res.json({ success: true });
-});
-
-// Endpoint debug
-app.get('/get_alerts', (req, res) => {
-  res.json(db.data.alerts || {});
-});
-
-// Send Telegram
-async function sendTelegram(tg_token, tg_chatid, text) {
-  const url = `https://api.telegram.org/bot${tg_token}/sendMessage`;
-  try {
-    await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: tg_chatid, text: text, parse_mode: 'HTML' })
-    });
-  } catch (e) {
-    console.error('Errore Telegram:', e);
-  }
-}
-
-// Get candele (stesso)
-async function getLastTwoCandles(symbol, exchange, interval = '5') {
-  let baseUrl = exchange === 'bybit'
-    ? `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=2`
-    : `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${BINANCE_MAP[interval] || '5m'}&limit=2`;
-
-  try {
-    const res = await fetch(baseUrl);
-    if (!res.ok) return null;
-    const data = await res.json();
-
-    let rawList = exchange === 'bybit' ? data.result?.list || [] : data;
-    if (!Array.isArray(rawList) || rawList.length < 2) return null;
-
-    const klines = rawList.map(c => ({
-      time: Number(c[0]) / 1000,
-      open: Number(c[1]),
-      high: Number(c[2]),
-      low: Number(c[3]),
-      close: Number(c[4])
-    }));
-
-    return exchange === 'bybit' ? { prev: klines[1], last: klines[0] } : { prev: klines[0], last: klines[1] };
-  } catch (e) {
-    console.error('Errore fetch candele:', e);
-    return null;
-  }
-}
-
-// Polling
-setInterval(async () => {
-  for (const device_id in db.data.alerts) {
-    for (const alert of db.data.alerts[device_id]) {
-      if (alert.triggered) continue;
-
-      const candles = await getLastTwoCandles(alert.symbol, alert.exchange);
-      if (!candles) continue;
-
-      const crossedUp = candles.prev.close < alert.price && candles.last.close >= alert.price;
-      const crossedDown = candles.prev.close > alert.price && candles.last.close <= alert.price;
-
-      if (crossedUp || crossedDown) {
-        const text = `🚨 <b>PRICE ALERT!</b>\n<b>${alert.symbol}</b> ha raggiunto ${alert.price.toFixed(2)}\nPrezzo attuale: <b>${candles.last.close.toFixed(2)}</b>\nExchange: ${alert.exchange.toUpperCase()}`;
-        await sendTelegram(alert.tg_token, alert.tg_chatid, text);
-        alert.triggered = true;
-        await db.write();
-      }
-    }
-  }
-}, 10000);
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server attivo su ${PORT}`));
