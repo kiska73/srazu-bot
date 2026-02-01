@@ -1,51 +1,52 @@
 const express = require('express');
 const fetch = require('node-fetch');
-const low = require('lowdb');
-const FileSync = require('lowdb/adapters/FileSync');
+const { JSONFile, Low } = require('lowdb'); // Cambiato per v7
 
 const app = express();
 app.use(express.json());
 
-const adapter = new FileSync('/var/data/alerts.json'); // Mount path per disk Render
-const db = low(adapter);
+const adapter = new JSONFile('/var/data/alerts.json'); // Usa JSONFile per v7
+const db = new Low(adapter);
 
-db.defaults({ alerts: {} }).write();
+await db.read(); // Obbligatorio in v7 per leggere il file
+db.data ||= { alerts: {} }; // Default se vuoto
 
 const BINANCE_MAP = {"1":"1m","3":"3m","5":"5m","15":"15m","30":"30m","60":"1h","240":"4h","D":"1d"};
 
 // Endpoint add
-app.post('/add_alert', (req, res) => {
+app.post('/add_alert', async (req, res) => {
   const { device_id, exchange, symbol, price, tg_token, tg_chatid } = req.body;
   if (!device_id || !symbol || !price || !tg_token || !tg_chatid) return res.status(400).json({ error: 'Missing data' });
 
-  let userAlerts = db.get(`alerts.${device_id}`).value() || [];
+  let userAlerts = db.data.alerts[device_id] || [];
   userAlerts = userAlerts.filter(a => a.symbol !== symbol);
   userAlerts.push({ symbol, price: Number(price), exchange, tg_token, tg_chatid, triggered: false });
 
-  db.set(`alerts.${device_id}`, userAlerts).write();
+  db.data.alerts[device_id] = userAlerts;
+  await db.write(); // Salva su disk
 
   console.log(`Alert aggiunto per ${symbol}`);
   res.json({ success: true });
 });
 
 // Endpoint remove
-app.post('/remove_alert', (req, res) => {
+app.post('/remove_alert', async (req, res) => {
   const { device_id, symbol } = req.body;
   if (!device_id || !symbol) return res.status(400).json({ error: 'Missing data' });
 
-  let userAlerts = db.get(`alerts.${device_id}`).value() || [];
+  let userAlerts = db.data.alerts[device_id] || [];
   userAlerts = userAlerts.filter(a => a.symbol !== symbol);
 
-  db.set(`alerts.${device_id}`, userAlerts).write();
+  db.data.alerts[device_id] = userAlerts;
+  await db.write();
 
   console.log(`Alert rimosso per ${symbol}`);
   res.json({ success: true });
 });
 
-// Endpoint debug: get all alerts
+// Endpoint debug
 app.get('/get_alerts', (req, res) => {
-  const allAlerts = db.get('alerts').value();
-  res.json(allAlerts);
+  res.json(db.data.alerts || {});
 });
 
 // Send Telegram
@@ -62,7 +63,7 @@ async function sendTelegram(tg_token, tg_chatid, text) {
   }
 }
 
-// Get candele
+// Get candele (stesso)
 async function getLastTwoCandles(symbol, exchange, interval = '5') {
   let baseUrl = exchange === 'bybit'
     ? `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=2`
@@ -93,9 +94,8 @@ async function getLastTwoCandles(symbol, exchange, interval = '5') {
 
 // Polling
 setInterval(async () => {
-  const allAlerts = db.get('alerts').value();
-  for (const device_id in allAlerts) {
-    for (const alert of allAlerts[device_id]) {
+  for (const device_id in db.data.alerts) {
+    for (const alert of db.data.alerts[device_id]) {
       if (alert.triggered) continue;
 
       const candles = await getLastTwoCandles(alert.symbol, alert.exchange);
@@ -108,7 +108,7 @@ setInterval(async () => {
         const text = `🚨 <b>PRICE ALERT!</b>\n<b>${alert.symbol}</b> ha raggiunto ${alert.price.toFixed(2)}\nPrezzo attuale: <b>${candles.last.close.toFixed(2)}</b>\nExchange: ${alert.exchange.toUpperCase()}`;
         await sendTelegram(alert.tg_token, alert.tg_chatid, text);
         alert.triggered = true;
-        db.set('alerts', allAlerts).write();
+        await db.write();
       }
     }
   }
