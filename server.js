@@ -6,7 +6,7 @@ const FileSync = require('lowdb/adapters/FileSync');
 const app = express();
 app.use(express.json());
 
-const adapter = new FileSync('alerts.json');
+const adapter = new FileSync('/var/data/alerts.json'); // Mount path per disk Render
 const db = low(adapter);
 
 db.defaults({ alerts: {} }).write();
