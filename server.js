@@ -1,47 +1,54 @@
 const express = require('express');
 const fetch = require('node-fetch');
-const app = express();
-app.use(express.json({ limit: '10mb' }));
+const low = require('lowdb');
+const FileSync = require('lowdb/adapters/FileSync');
 
-// Alerts in memoria (con piano pagato non si perde al restart, ma per sicurezza puoi aggiungere salvataggio su file se vuoi)
-let alerts = {}; // { device_id: [{symbol, price, exchange, tg_token, tg_chatid, triggered}] }
+const app = express();
+app.use(express.json());
+
+const adapter = new FileSync('alerts.json');
+const db = low(adapter);
+
+db.defaults({ alerts: {} }).write();
 
 const BINANCE_MAP = {"1":"1m","3":"3m","5":"5m","15":"15m","30":"30m","60":"1h","240":"4h","D":"1d"};
 
-// Endpoint per aggiungere alert
+// Endpoint add
 app.post('/add_alert', (req, res) => {
   const { device_id, exchange, symbol, price, tg_token, tg_chatid } = req.body;
   if (!device_id || !symbol || !price || !tg_token || !tg_chatid) return res.status(400).json({ error: 'Missing data' });
 
-  if (!alerts[device_id]) alerts[device_id] = [];
-  // Rimuovi alert vecchio per lo stesso symbol
-  alerts[device_id] = alerts[device_id].filter(a => a.symbol !== symbol);
-  alerts[device_id].push({
-    symbol,
-    price: Number(price),
-    exchange,
-    tg_token,
-    tg_chatid,
-    triggered: false
-  });
+  let userAlerts = db.get(`alerts.${device_id}`).value() || [];
+  userAlerts = userAlerts.filter(a => a.symbol !== symbol);
+  userAlerts.push({ symbol, price: Number(price), exchange, tg_token, tg_chatid, triggered: false });
 
-  console.log(`Alert aggiunto per ${symbol} a ${price}`);
+  db.set(`alerts.${device_id}`, userAlerts).write();
+
+  console.log(`Alert aggiunto per ${symbol}`);
   res.json({ success: true });
 });
 
-// Endpoint per rimuovere alert
+// Endpoint remove
 app.post('/remove_alert', (req, res) => {
   const { device_id, symbol } = req.body;
   if (!device_id || !symbol) return res.status(400).json({ error: 'Missing data' });
 
-  if (alerts[device_id]) {
-    alerts[device_id] = alerts[device_id].filter(a => a.symbol !== symbol);
-    console.log(`Alert rimosso per ${symbol}`);
-  }
+  let userAlerts = db.get(`alerts.${device_id}`).value() || [];
+  userAlerts = userAlerts.filter(a => a.symbol !== symbol);
+
+  db.set(`alerts.${device_id}`, userAlerts).write();
+
+  console.log(`Alert rimosso per ${symbol}`);
   res.json({ success: true });
 });
 
-// Funzione per inviare messaggio Telegram
+// Endpoint debug: get all alerts
+app.get('/get_alerts', (req, res) => {
+  const allAlerts = db.get('alerts').value();
+  res.json(allAlerts);
+});
+
+// Send Telegram
 async function sendTelegram(tg_token, tg_chatid, text) {
   const url = `https://api.telegram.org/bot${tg_token}/sendMessage`;
   try {
@@ -55,7 +62,7 @@ async function sendTelegram(tg_token, tg_chatid, text) {
   }
 }
 
-// Funzione per fetch ultime 2 candele (per check cross)
+// Get candele
 async function getLastTwoCandles(symbol, exchange, interval = '5') {
   let baseUrl = exchange === 'bybit'
     ? `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=2`
@@ -84,14 +91,15 @@ async function getLastTwoCandles(symbol, exchange, interval = '5') {
   }
 }
 
-// Polling continuo per controllare tutti gli alert
+// Polling
 setInterval(async () => {
-  for (const device_id in alerts) {
-    for (const alert of alerts[device_id]) {
+  const allAlerts = db.get('alerts').value();
+  for (const device_id in allAlerts) {
+    for (const alert of allAlerts[device_id]) {
       if (alert.triggered) continue;
 
-      const candles = await getLastTwoCandles(alert.symbol, alert.exchange, '5');
-      if (!candles || !candles.prev || !candles.last) continue;
+      const candles = await getLastTwoCandles(alert.symbol, alert.exchange);
+      if (!candles) continue;
 
       const crossedUp = candles.prev.close < alert.price && candles.last.close >= alert.price;
       const crossedDown = candles.prev.close > alert.price && candles.last.close <= alert.price;
@@ -100,14 +108,11 @@ setInterval(async () => {
         const text = `🚨 <b>PRICE ALERT!</b>\n<b>${alert.symbol}</b> ha raggiunto ${alert.price.toFixed(2)}\nPrezzo attuale: <b>${candles.last.close.toFixed(2)}</b>\nExchange: ${alert.exchange.toUpperCase()}`;
         await sendTelegram(alert.tg_token, alert.tg_chatid, text);
         alert.triggered = true;
-        console.log(`Alert inviato per ${alert.symbol}`);
+        db.set('alerts', allAlerts).write();
       }
     }
   }
-}, 10000); // ogni 10 secondi (puoi cambiare a 5000 per più veloce)
-
-// Endpoint base per test (opzionale)
-app.get('/', (req, res) => res.send('SRAZU Bot attivo!'));
+}, 10000);
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server attivo su port ${PORT}`));
+app.listen(PORT, () => console.log(`Server attivo su ${PORT}`));
