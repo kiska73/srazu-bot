@@ -9,30 +9,30 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const ALERT_FILE = "./alerts.json";
 
-// Telegram BOT token (Render ENV)
-const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
-if (!TG_BOT_TOKEN) {
-    console.error("❌ TG_BOT_TOKEN missing in ENV");
-    process.exit(1);
-}
-
-/* ================= FILE UTILS ================= */
-
+/* =====================================================
+   FILE UTILS
+===================================================== */
 function loadAlerts() {
     try {
         if (!fs.existsSync(ALERT_FILE)) return [];
         return JSON.parse(fs.readFileSync(ALERT_FILE, "utf8"));
-    } catch {
+    } catch (e) {
+        console.error("Read alerts error:", e.message);
         return [];
     }
 }
 
 function saveAlerts(alerts) {
-    fs.writeFileSync(ALERT_FILE, JSON.stringify(alerts, null, 2));
+    try {
+        fs.writeFileSync(ALERT_FILE, JSON.stringify(alerts, null, 2));
+    } catch (e) {
+        console.error("Save alerts error:", e.message);
+    }
 }
 
-/* ================= PRICE FETCH ================= */
-
+/* =====================================================
+   PRICE FETCH
+===================================================== */
 async function getLastPrice(exchange, symbol) {
     try {
         if (exchange === "bybit") {
@@ -56,30 +56,38 @@ async function getLastPrice(exchange, symbol) {
     return 0;
 }
 
-/* ================= TELEGRAM ================= */
+/* =====================================================
+   TELEGRAM
+===================================================== */
+async function sendTelegram(chatId, text, botToken) {
+    if (!botToken) {
+        console.error("🚨 Bot token missing in JSON!");
+        return false;
+    }
 
-async function sendTelegram(chatId, text) {
     try {
         const url =
-            `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage` +
+            `https://api.telegram.org/bot${botToken}/sendMessage` +
             `?chat_id=${chatId}&parse_mode=HTML&text=${encodeURIComponent(text)}`;
 
         const r = await fetch(url);
         const j = await r.json();
-        return j.ok;
-    } catch {
+        if (!j.ok) throw new Error(j.description);
+        return true;
+    } catch (e) {
+        console.error("Telegram error:", e.message);
         return false;
     }
 }
 
-/* ================= ROUTES ================= */
-
-// compatibile con la tua app
+/* =====================================================
+   ROUTES
+===================================================== */
 app.post("/add_alert", (req, res) => {
-    const { device_id, exchange, symbol, price, chat_id } = req.body;
+    const { device_id, exchange, symbol, price, chat_id, bot_token } = req.body;
 
-    if (!device_id || !exchange || !symbol || !price || !chat_id) {
-        return res.status(400).json({ ok: false });
+    if (!device_id || !exchange || !symbol || !price || !chat_id || !bot_token) {
+        return res.status(400).json({ ok: false, error: "Missing fields" });
     }
 
     const alerts = loadAlerts();
@@ -90,11 +98,13 @@ app.post("/add_alert", (req, res) => {
         symbol: symbol.toUpperCase(),
         price: Number(price),
         chat_id,
+        bot_token,   // ✅ token preso dal JSON
         created: Date.now()
     });
 
     saveAlerts(alerts);
-    console.log(`✅ ALERT ADDED ${symbol} @ ${price}`);
+
+    console.log(`✅ ALERT ADDED | ${symbol} @ ${price}`);
     res.json({ ok: true });
 });
 
@@ -113,12 +123,17 @@ app.post("/remove_alert", (req, res) => {
             )
     );
 
-    if (alerts.length !== before) saveAlerts(alerts);
+    if (alerts.length !== before) {
+        saveAlerts(alerts);
+        console.log(`🗑️ ALERT REMOVED | ${symbol}`);
+    }
+
     res.json({ ok: true });
 });
 
-/* ================= ALERT LOOP ================= */
-
+/* =====================================================
+   ALERT LOOP
+===================================================== */
 setInterval(async () => {
     let alerts = loadAlerts();
     if (!alerts.length) return;
@@ -129,9 +144,8 @@ setInterval(async () => {
         const price = await getLastPrice(alert.exchange, alert.symbol);
         if (!price) continue;
 
-        // trigger semplice (come vuoi tu)
         if (price >= alert.price || price <= alert.price) {
-            console.log(`🎯 HIT ${alert.symbol} ${price}`);
+            console.log(`🎯 TARGET HIT | ${alert.symbol} @ ${price}`);
 
             const tradeUrl =
                 alert.exchange === "bybit"
@@ -145,7 +159,7 @@ setInterval(async () => {
                 `Current: ${price}\n\n` +
                 `<a href="${tradeUrl}">OPEN TRADE</a>`;
 
-            const ok = await sendTelegram(alert.chat_id, msg);
+            const ok = await sendTelegram(alert.chat_id, msg, alert.bot_token);
             if (ok) {
                 alert._done = true;
                 changed = true;
@@ -156,12 +170,14 @@ setInterval(async () => {
     if (changed) {
         alerts = alerts.filter(a => !a._done);
         saveAlerts(alerts);
+        console.log("🧹 alerts.json cleaned");
     }
 }, 5000);
 
-/* ================= START ================= */
-
+/* =====================================================
+   START SERVER
+===================================================== */
 app.listen(PORT, () => {
-    console.log(`🚀 Server running on ${PORT}`);
-    console.log(`📂 alerts.json → ${path.resolve(ALERT_FILE)}`);
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📂 Alert file: ${path.resolve(ALERT_FILE)}`);
 });
