@@ -1,8 +1,10 @@
 import fs from 'fs';
 import axios from 'axios';
+import TelegramBot from 'node-telegram-bot-api';
 
 const ALERT_FILE = './alerts.json';
 const POLL_INTERVAL = 5000; // 5 secondi
+
 let alerts = [];
 
 // Carica gli alert dal file
@@ -19,6 +21,28 @@ function loadAlerts() {
 // Salva gli alert aggiornati (per triggered)
 function saveAlerts() {
   fs.writeFileSync(ALERT_FILE, JSON.stringify(alerts, null, 2));
+}
+
+// Legge il token e l'ID chat dal JSON, esempio:
+function getTelegramConfig() {
+  try {
+    const data = fs.readFileSync(ALERT_FILE);
+    const json = JSON.parse(data);
+    // Deve avere token e chatId al livello root o nel primo oggetto alert
+    const token = json[0]?.tgToken || process.env.TG_BOT_TOKEN;
+    const chatId = json[0]?.tgChatId || process.env.TG_CHAT_ID;
+    if (!token || !chatId) throw new Error('Telegram token o chatId mancanti');
+    return { token, chatId };
+  } catch (err) {
+    console.error('Errore leggendo Telegram config:', err);
+    return null;
+  }
+}
+
+const tgConfig = getTelegramConfig();
+let bot = null;
+if (tgConfig) {
+  bot = new TelegramBot(tgConfig.token, { polling: false });
 }
 
 // Fetch prezzi Binance
@@ -69,7 +93,7 @@ async function fetchPrices() {
 }
 
 // Controlla alert e aggiorna triggered
-function checkAlerts(prices) {
+async function checkAlerts(prices) {
   let triggeredSomething = false;
 
   for (const alert of alerts) {
@@ -79,12 +103,23 @@ function checkAlerts(prices) {
     const current = prices[key];
     if (current === undefined) continue;
 
+    let message = null;
+
     if (alert.type === 'above' && current >= alert.price) {
-      console.log(`🚨 [${alert.exchange}] ${alert.symbol} sopra ${alert.price}! Prezzo attuale: ${current}`);
-      alert.triggered = true;
-      triggeredSomething = true;
+      message = `🚨 [${alert.exchange}] ${alert.symbol} sopra ${alert.price}! Prezzo attuale: ${current}`;
     } else if (alert.type === 'below' && current <= alert.price) {
-      console.log(`🚨 [${alert.exchange}] ${alert.symbol} sotto ${alert.price}! Prezzo attuale: ${current}`);
+      message = `🚨 [${alert.exchange}] ${alert.symbol} sotto ${alert.price}! Prezzo attuale: ${current}`;
+    }
+
+    if (message) {
+      console.log(message);
+      if (bot) {
+        try {
+          await bot.sendMessage(tgConfig.chatId, message);
+        } catch (err) {
+          console.error('Errore inviando Telegram:', err.message);
+        }
+      }
       alert.triggered = true;
       triggeredSomething = true;
     }
@@ -100,7 +135,7 @@ async function main() {
 
   setInterval(async () => {
     const prices = await fetchPrices();
-    checkAlerts(prices);
+    await checkAlerts(prices);
   }, POLL_INTERVAL);
 }
 
