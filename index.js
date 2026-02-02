@@ -2,16 +2,22 @@ import express from "express";
 import fs from "fs";
 import fetch from "node-fetch";
 import path from "path";
+import { ChartJSNodeCanvas } from "chartjs-node-canvas";
+import { Canvas, createCanvas } from "canvas";
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// Utilizziamo un percorso relativo per evitare errori di permessi su Render
 const ALERT_FILE = "./alerts.json";
 
-/* ---------------- HELPERS PER I FILE ---------------- */
+// Inizializza ChartJSNodeCanvas
+const width = 800;
+const height = 400;
+const chartJSNodeCanvas = new ChartJSNodeCanvas({ width, height, chartCallback: (ChartJS) => {
+    ChartJS.defaults.global.defaultFontFamily = 'Arial';
+} });
 
 function loadAlerts() {
     try {
@@ -19,7 +25,7 @@ function loadAlerts() {
         const data = fs.readFileSync(ALERT_FILE, "utf8");
         return JSON.parse(data);
     } catch (e) {
-        console.error("❌ Errore lettura alerts.json:", e.message);
+        console.error("❌ Error reading alerts.json:", e.message);
         return [];
     }
 }
@@ -28,11 +34,9 @@ function saveAlerts(alerts) {
     try {
         fs.writeFileSync(ALERT_FILE, JSON.stringify(alerts, null, 2));
     } catch (e) {
-        console.error("❌ Errore salvataggio alerts.json:", e.message);
+        console.error("❌ Error saving alerts.json:", e.message);
     }
 }
-
-/* ---------------- RECUPERO PREZZI ---------------- */
 
 async function getLastPrice(exchange, symbol) {
     try {
@@ -51,43 +55,125 @@ async function getLastPrice(exchange, symbol) {
             }
         }
     } catch (e) {
-        console.error(`⚠️ Errore fetch ${exchange} per ${symbol}:`, e.message);
+        console.error(`⚠️ Error fetching ${exchange} for ${symbol}:`, e.message);
     }
     return null;
 }
 
-/* ---------------- INVIO TELEGRAM ---------------- */
+async function fetchKlines(exchange, symbol, interval = "30", limit = 50) {
+    let baseUrl = "";
+    if (exchange === "bybit") {
+        baseUrl = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    } else if (exchange === "binance") {
+        baseUrl = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=30m&limit=${limit}`;
+    }
 
-async function sendTelegram(token, chatId, text) {
-    const url = `https://api.telegram.org/bot${token}/sendMessage`;
     try {
-        const r = await fetch(url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                chat_id: chatId,
-                text,
-                parse_mode: "HTML",
-                disable_web_page_preview: true
-            })
-        });
-        const res = await r.json();
-        if (!res.ok) throw new Error(res.description);
-        return true;
+        const r = await fetch(baseUrl);
+        const j = await r.json();
+        let rawList = exchange === "bybit" ? (j.result?.list || []) : j;
+        const klines = rawList.map(c => ({
+            time: Number(c[0]) / 1000,
+            open: Number(c[1]),
+            high: Number(c[2]),
+            low: Number(c[3]),
+            close: Number(c[4])
+        }));
+        return exchange === "bybit" ? klines.reverse() : klines;
     } catch (e) {
-        console.error("❌ Errore invio Telegram:", e.message);
+        console.error(`❌ Error fetching klines for ${symbol}:`, e.message);
+        return [];
+    }
+}
+
+async function generateChartImage(exchange, symbol, klines) {
+    const configuration = {
+        type: 'candlestick',
+        data: {
+            datasets: [{
+                label: symbol,
+                data: klines.map(k => ({
+                    x: k.time * 1000,
+                    o: k.open,
+                    h: k.high,
+                    l: k.low,
+                    c: k.close
+                })),
+                color: {
+                    up: '#ffffff',
+                    down: '#0051D4',
+                    border: {
+                        up: '#ffffff',
+                        down: '#0051D4'
+                    },
+                    wick: {
+                        up: '#cccccc',
+                        down: '#0051D4'
+                    }
+                }
+            }]
+        },
+        options: {
+            scales: {
+                x: {
+                    type: 'time',
+                    time: {
+                        unit: 'minute',
+                        displayFormats: { minute: 'HH:mm' }
+                    },
+                    ticks: { color: '#d1d4dc' }
+                },
+                y: { ticks: { color: '#d1d4dc' } }
+            },
+            plugins: { legend: { display: false } },
+            responsive: true
+        }
+    };
+
+    try {
+        const imageBuffer = await chartJSNodeCanvas.renderToBuffer(configuration);
+        const imagePath = `./chart_${symbol}.png`;
+        fs.writeFileSync(imagePath, imageBuffer);
+        return imagePath;
+    } catch (e) {
+        console.error("❌ Error generating chart:", e.message);
+        return null;
+    }
+}
+
+async function sendTelegram(token, chatId, text, photoPath = null) {
+    const baseUrl = `https://api.telegram.org/bot${token}`;
+    try {
+        if (photoPath) {
+            const formData = new FormData();
+            formData.append('photo', fs.createReadStream(photoPath));
+            formData.append('chat_id', chatId);
+            formData.append('caption', text);
+            formData.append('parse_mode', 'HTML');
+
+            const r = await fetch(`${baseUrl}/sendPhoto`, { method: "POST", body: formData });
+            const res = await r.json();
+            if (!res.ok) throw new Error(res.description);
+            fs.unlinkSync(photoPath);
+            return true;
+        } else {
+            const url = `${baseUrl}/sendMessage?chat_id=${chatId}&text=${encodeURIComponent(text)}&parse_mode=HTML`;
+            const r = await fetch(url);
+            const res = await r.json();
+            if (!res.ok) throw new Error(res.description);
+            return true;
+        }
+    } catch (e) {
+        console.error("❌ Error sending Telegram:", e.message);
         return false;
     }
 }
 
-/* ---------------- ROTTE API ---------------- */
-
-// Riceve l'alert dal browser
 app.post("/set_alert", (req, res) => {
     const { device_id, exchange, symbol, price, direction, tgToken, tgChatId } = req.body;
     
     if (!tgToken || !tgChatId) {
-        return res.status(400).json({ ok: false, error: "Mancano Token o ChatID Telegram" });
+        return res.status(400).json({ ok: false, error: "Missing Telegram Token or ChatID" });
     }
 
     let alerts = loadAlerts();
@@ -107,11 +193,10 @@ app.post("/set_alert", (req, res) => {
     alerts.push(newAlert);
     saveAlerts(alerts);
     
-    console.log(`✅ Alert impostato: ${newAlert.symbol} a ${newAlert.price} (${direction})`);
+    console.log(`✅ Alert set: ${newAlert.symbol} at ${newAlert.price} (${direction})`);
     res.json({ ok: true });
 });
 
-// Rimuove l'alert
 app.post("/remove_alert", (req, res) => {
     let alerts = loadAlerts();
     const initialCount = alerts.length;
@@ -122,12 +207,10 @@ app.post("/remove_alert", (req, res) => {
 
     if (alerts.length !== initialCount) {
         saveAlerts(alerts);
-        console.log(`🗑️ Alert rimosso per ${req.body.symbol}`);
+        console.log(`🗑️ Alert removed for ${req.body.symbol}`);
     }
     res.json({ ok: true });
 });
-
-/* ---------------- LOOP DI CONTROLLO (Ogni 5 secondi) ---------------- */
 
 setInterval(async () => {
     let alerts = loadAlerts();
@@ -145,7 +228,7 @@ setInterval(async () => {
                       (alert.direction === "down" && currentPrice <= alert.price);
 
         if (isHit) {
-            console.log(`🎯 TARGET RAGGIUNTO: ${alert.symbol} a ${currentPrice}`);
+            console.log(`🎯 TARGET HIT: ${alert.symbol} at ${currentPrice}`);
 
             const exchangeUrl = alert.exchange === "bybit" 
                 ? `https://www.bybit.com/trade/usdt/${alert.symbol}`
@@ -154,11 +237,14 @@ setInterval(async () => {
             const message = `🚨 <b>PRICE ALERT</b>\n\n` +
                           `<b>Asset:</b> ${alert.symbol}\n` +
                           `<b>Target:</b> ${alert.price}\n` +
-                          `<b>Prezzo Attuale:</b> ${currentPrice}\n` +
+                          `<b>Current Price:</b> ${currentPrice}\n` +
                           `<b>Exchange:</b> ${alert.exchange.toUpperCase()}\n\n` +
-                          `<a href="${exchangeUrl}">👉 APRI TRADE</a>`;
+                          `<a href="${exchangeUrl}">👉 OPEN TRADE</a>`;
 
-            const success = await sendTelegram(alert.tgToken, alert.tgChatId, message);
+            const klines = await fetchKlines(alert.exchange, alert.symbol);
+            const photoPath = klines.length > 0 ? await generateChartImage(alert.exchange, alert.symbol, klines) : null;
+
+            const success = await sendTelegram(alert.tgToken, alert.tgChatId, message, photoPath);
             
             if (success) {
                 alert.triggered = true;
@@ -167,17 +253,14 @@ setInterval(async () => {
         }
     }
 
-    // Pulizia: rimuoviamo gli alert già inviati per non intasare il file
     if (changed) {
         const remainingAlerts = alerts.filter(a => !a.triggered);
         saveAlerts(remainingAlerts);
-        console.log("🧹 File alerts.json aggiornato e pulito.");
+        console.log("🧹 alerts.json updated and cleaned.");
     }
 }, 5000);
 
-/* ---------------- AVVIO SERVER ---------------- */
-
 app.listen(PORT, () => {
-    console.log(`🚀 Alert Server attivo sulla porta ${PORT}`);
-    console.log(`📂 File alert: ${path.resolve(ALERT_FILE)}`);
+    console.log(`🚀 Alert Server running on port ${PORT}`);
+    console.log(`📂 Alert file: ${path.resolve(ALERT_FILE)}`);
 });
