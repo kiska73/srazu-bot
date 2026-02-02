@@ -1,7 +1,7 @@
 {
-  "name": "crypto-price-alert",
+  "name": "telegram-crypto-bot",
   "version": "1.0.0",
-  "description": "Bot Telegram per alert prezzi crypto",
+  "description": "Bot per alert prezzi crypto gestito da JSON esterno",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
