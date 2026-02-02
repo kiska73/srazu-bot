@@ -1,142 +1,73 @@
-import fs from 'fs';
-import axios from 'axios';
-import TelegramBot from 'node-telegram-bot-api';
+import fs from "fs";
+import axios from "axios";
 
-const ALERT_FILE = './alerts.json';
-const POLL_INTERVAL = 5000; // 5 secondi
+// --- Configura il JSON locale ---
+const ALERT_FILE = "./alerts.json"; // percorso al tuo JSON
+let alertsData = { telegram: {}, alerts: [] };
 
-let alerts = [];
-
-// Carica gli alert dal file
+// --- Funzione per leggere JSON ---
 function loadAlerts() {
   try {
-    const data = fs.readFileSync(ALERT_FILE);
-    alerts = JSON.parse(data);
-    console.log(`⚡ ${alerts.length} alerts caricati`);
-  } catch (err) {
-    console.error('Errore caricando alerts.json:', err);
-  }
-}
-
-// Salva gli alert aggiornati (per triggered)
-function saveAlerts() {
-  fs.writeFileSync(ALERT_FILE, JSON.stringify(alerts, null, 2));
-}
-
-// Legge il token e l'ID chat dal JSON, esempio:
-function getTelegramConfig() {
-  try {
-    const data = fs.readFileSync(ALERT_FILE);
-    const json = JSON.parse(data);
-    // Deve avere token e chatId al livello root o nel primo oggetto alert
-    const token = json[0]?.tgToken || process.env.TG_BOT_TOKEN;
-    const chatId = json[0]?.tgChatId || process.env.TG_CHAT_ID;
-    if (!token || !chatId) throw new Error('Telegram token o chatId mancanti');
-    return { token, chatId };
-  } catch (err) {
-    console.error('Errore leggendo Telegram config:', err);
-    return null;
-  }
-}
-
-const tgConfig = getTelegramConfig();
-let bot = null;
-if (tgConfig) {
-  bot = new TelegramBot(tgConfig.token, { polling: false });
-}
-
-// Fetch prezzi Binance
-async function fetchBinance(symbol) {
-  try {
-    const res = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
-    return parseFloat(res.data.price);
-  } catch (err) {
-    console.error('Errore Binance', symbol, err.message);
-    return null;
-  }
-}
-
-// Fetch prezzi Bybit
-async function fetchBybit(symbol) {
-  try {
-    const res = await axios.get(`https://api.bybit.com/v2/public/tickers?symbol=${symbol}`);
-    if (res.data.result && res.data.result.length > 0) {
-      return parseFloat(res.data.result[0].last_price);
+    const raw = fs.readFileSync(ALERT_FILE);
+    alertsData = JSON.parse(raw);
+    if (!alertsData.telegram?.token || !alertsData.telegram?.chatId) {
+      console.error("Errore: Telegram token o chatId mancanti nel JSON");
     }
-    return null;
-  } catch (err) {
-    console.error('Errore Bybit', symbol, err.message);
+    console.log(`⚡ ${alertsData.alerts.length} alerts caricati`);
+  } catch (e) {
+    console.error("Errore leggendo JSON:", e.message);
+  }
+}
+
+// --- Funzione per inviare messaggi Telegram ---
+async function sendTelegram(message) {
+  const { token, chatId } = alertsData.telegram;
+  if (!token || !chatId) return;
+
+  try {
+    await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+      chat_id: chatId,
+      text: message
+    });
+    console.log("📩 Messaggio inviato:", message);
+  } catch (e) {
+    console.error("Errore Telegram:", e.message);
+  }
+}
+
+// --- Funzione per prendere prezzo da Binance (pubblico) ---
+async function getBinancePrice(symbol) {
+  try {
+    const resp = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
+    return parseFloat(resp.data.price);
+  } catch (e) {
+    console.error(`Errore Binance ${symbol}:`, e.message);
     return null;
   }
 }
 
-// Fetch solo i simboli necessari
-async function fetchPrices() {
-  const prices = {};
-  const grouped = {};
+// --- Controlla alert singoli ---
+async function checkAlerts() {
+  for (const alert of alertsData.alerts) {
+    const price = await getBinancePrice(alert.symbol);
+    if (price === null) continue;
 
-  for (const alert of alerts) {
-    if (alert.triggered) continue; // salta quelli già triggerati
-    const key = `${alert.exchange}:${alert.symbol}`;
-    grouped[key] = alert;
-  }
-
-  await Promise.all(Object.keys(grouped).map(async (key) => {
-    const [exchange, symbol] = key.split(':');
-    let price = null;
-    if (exchange === 'binance') price = await fetchBinance(symbol);
-    if (exchange === 'bybit') price = await fetchBybit(symbol);
-    if (price !== null) prices[key] = price;
-  }));
-
-  return prices;
-}
-
-// Controlla alert e aggiorna triggered
-async function checkAlerts(prices) {
-  let triggeredSomething = false;
-
-  for (const alert of alerts) {
-    if (alert.triggered) continue;
-
-    const key = `${alert.exchange}:${alert.symbol}`;
-    const current = prices[key];
-    if (current === undefined) continue;
-
-    let message = null;
-
-    if (alert.type === 'above' && current >= alert.price) {
-      message = `🚨 [${alert.exchange}] ${alert.symbol} sopra ${alert.price}! Prezzo attuale: ${current}`;
-    } else if (alert.type === 'below' && current <= alert.price) {
-      message = `🚨 [${alert.exchange}] ${alert.symbol} sotto ${alert.price}! Prezzo attuale: ${current}`;
-    }
-
-    if (message) {
-      console.log(message);
-      if (bot) {
-        try {
-          await bot.sendMessage(tgConfig.chatId, message);
-        } catch (err) {
-          console.error('Errore inviando Telegram:', err.message);
-        }
+    if (!alert.triggered) {
+      // all'inizio decidiamo se è "above" o "below"
+      if (alert.direction === "above" && price >= alert.price) {
+        await sendTelegram(`⚠️ ${alert.symbol} è sopra ${alert.price}: ${price}`);
+        alert.triggered = true;
+      } else if (alert.direction === "below" && price <= alert.price) {
+        await sendTelegram(`⚠️ ${alert.symbol} è sotto ${alert.price}: ${price}`);
+        alert.triggered = true;
       }
-      alert.triggered = true;
-      triggeredSomething = true;
     }
   }
-
-  if (triggeredSomething) saveAlerts();
 }
 
-// Loop principale
-async function main() {
-  loadAlerts();
-  console.log('Server price alert attivo ✅');
+// --- Avvio server ---
+loadAlerts();
+console.log("Server price alert attivo ✅");
 
-  setInterval(async () => {
-    const prices = await fetchPrices();
-    await checkAlerts(prices);
-  }, POLL_INTERVAL);
-}
-
-main();
+// --- Loop ogni 5 secondi ---
+setInterval(checkAlerts, 5000);
