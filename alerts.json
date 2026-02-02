@@ -1,1 +1,22 @@
-[]
+{
+  "telegram": {
+    "token": "INSERISCI_QUI_IL_TUO_TOKEN_TELEGRAM",
+    "chatId": "INSERISCI_QUI_IL_TUO_CHAT_ID"
+  },
+  "alerts": [
+    {
+      "id": 1,
+      "symbol": "BTCUSDT",
+      "price": 98000,
+      "direction": "above",
+      "triggered": false
+    },
+    {
+      "id": 2,
+      "symbol": "ETHUSDT",
+      "price": 2800,
+      "direction": "below",
+      "triggered": false
+    }
+  ]
+}
