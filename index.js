@@ -1,28 +1,32 @@
 import fs from "fs";
 import axios from "axios";
 
-// --- Configura il JSON locale ---
-const ALERT_FILE = "./alerts.json"; // percorso al tuo JSON
+const ALERT_FILE = "./alerts.json";
 let alertsData = { telegram: {}, alerts: [] };
 
-// --- Funzione per leggere JSON ---
 function loadAlerts() {
   try {
     const raw = fs.readFileSync(ALERT_FILE);
-    alertsData = JSON.parse(raw);
-    if (!alertsData.telegram?.token || !alertsData.telegram?.chatId) {
-      console.error("Errore: Telegram token o chatId mancanti nel JSON");
-    }
+    const data = JSON.parse(raw);
+
+    // Assicuriamoci che siano oggetti/array validi
+    alertsData.telegram = data.telegram || {};
+    alertsData.alerts = Array.isArray(data.alerts) ? data.alerts : [];
+
     console.log(`⚡ ${alertsData.alerts.length} alerts caricati`);
   } catch (e) {
     console.error("Errore leggendo JSON:", e.message);
+    alertsData.telegram = {};
+    alertsData.alerts = [];
   }
 }
 
-// --- Funzione per inviare messaggi Telegram ---
 async function sendTelegram(message) {
   const { token, chatId } = alertsData.telegram;
-  if (!token || !chatId) return;
+  if (!token || !chatId) {
+    console.log("⚠️ Telegram token o chatId mancanti, messaggio non inviato");
+    return;
+  }
 
   try {
     await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
@@ -35,7 +39,6 @@ async function sendTelegram(message) {
   }
 }
 
-// --- Funzione per prendere prezzo da Binance (pubblico) ---
 async function getBinancePrice(symbol) {
   try {
     const resp = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
@@ -46,14 +49,17 @@ async function getBinancePrice(symbol) {
   }
 }
 
-// --- Controlla alert singoli ---
 async function checkAlerts() {
+  if (!alertsData.alerts || !Array.isArray(alertsData.alerts) || alertsData.alerts.length === 0) {
+    console.log("🔹 Nessun alert da controllare");
+    return;
+  }
+
   for (const alert of alertsData.alerts) {
     const price = await getBinancePrice(alert.symbol);
     if (price === null) continue;
 
     if (!alert.triggered) {
-      // all'inizio decidiamo se è "above" o "below"
       if (alert.direction === "above" && price >= alert.price) {
         await sendTelegram(`⚠️ ${alert.symbol} è sopra ${alert.price}: ${price}`);
         alert.triggered = true;
@@ -65,9 +71,9 @@ async function checkAlerts() {
   }
 }
 
-// --- Avvio server ---
+// Carica alert
 loadAlerts();
 console.log("Server price alert attivo ✅");
 
-// --- Loop ogni 5 secondi ---
+// Controllo ogni 5 secondi
 setInterval(checkAlerts, 5000);
