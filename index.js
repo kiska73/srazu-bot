@@ -131,12 +131,23 @@ async function checkAlerts() {
 
 async function sendTelegram(token, chatId, text) {
     try {
-        await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+        // .trim() rimuove spazi vuoti accidentali all'inizio o alla fine
+        const cleanToken = token.trim(); 
+        const url = `https://api.telegram.org/bot${cleanToken}/sendMessage`;
+        
+        await axios.post(url, {
             chat_id: chatId,
             text: text,
             parse_mode: "HTML"
         });
-    } catch (e) { console.error("Errore Telegram:", e.message); }
+        console.log("✅ Telegram inviato con successo!");
+    } catch (e) {
+        // Se l'errore persiste, stampiamo l'URL (senza token completo) per capire
+        console.error(`❌ Errore API Telegram: ${e.response ? e.response.statusText : e.message}`);
+        if (e.response && e.response.status === 404) {
+            console.error("⚠️ Il Token Bot sembra non essere valido. Controllalo su @BotFather.");
+        }
+    }
 }
 
 function saveData() {
