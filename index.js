@@ -3,127 +3,137 @@ const axios = require("axios");
 const express = require("express");
 const cors = require("cors");
 
-const ALERT_FILE = "./alerts.json";
+// Configurazione Percorsi (Usa il Volume /data se presente, altrimenti locale)
+const ALERT_FILE = process.env.RENDER ? "/data/alerts.json" : "./alerts.json";
 const PORT = process.env.PORT || 3000;
 
 const app = express();
-app.use(cors()); // Permette alla tua App di comunicare con il server
+app.use(cors());
 app.use(express.json());
 
 let alertsData = { active_alerts: [] };
 
-// Caricamento dati salvati all'avvio
+// --- CARICAMENTO INIZIALE ---
 function loadData() {
     try {
         if (fs.existsSync(ALERT_FILE)) {
-            alertsData = JSON.parse(fs.readFileSync(ALERT_FILE, "utf8"));
+            const raw = fs.readFileSync(ALERT_FILE, "utf8");
+            alertsData = JSON.parse(raw);
+            console.log(`📂 JSON caricato. Alert attivi: ${alertsData.active_alerts.length}`);
+        } else {
+            console.log("🆕 Nessun file JSON trovato, ne verrà creato uno nuovo.");
         }
-    } catch (e) { console.error("Errore caricamento file:", e); }
+    } catch (e) {
+        console.error("❌ Errore lettura JSON:", e.message);
+    }
 }
 loadData();
 
-// --- ENDPOINT PER LA TUA APP ---
+// --- API PER L'APP (FRONTEND) ---
 
-// Riceve l'alert quando l'utente lo attiva nell'App
 app.post("/set_alert", (req, res) => {
     const { device_id, exchange, symbol, price, token, chatId } = req.body;
 
-    // Rimuove eventuali alert duplicati per lo stesso simbolo/dispositivo
+    // Pulizia: Rimuove vecchi alert per lo stesso simbolo dello stesso utente
     alertsData.active_alerts = alertsData.active_alerts.filter(a => 
         !(a.device_id === device_id && a.symbol === symbol)
     );
 
-    // Aggiunge il nuovo alert con i dati inviati dalla tua App
     alertsData.active_alerts.push({
         device_id,
         exchange: exchange || "bybit",
         symbol: symbol.toUpperCase(),
         price: parseFloat(price),
-        token,
-        chatId,
+        token: token.trim(), // Puliamo il token da spazi
+        chatId: chatId,
         triggered: false,
-        timestamp: Date.now()
+        lastPrice: null
     });
 
     saveData();
-    console.log(`📌 Alert Registrato: ${symbol} @ ${price} (${exchange})`);
+    console.log(`📌 Alert impostato dall'App: ${symbol} @ ${price}`);
     res.json({ status: "success" });
 });
 
-// Rimuove l'alert quando l'utente lo cancella nell'App
 app.post("/remove_alert", (req, res) => {
     const { device_id, symbol } = req.body;
     alertsData.active_alerts = alertsData.active_alerts.filter(a => 
         !(a.device_id === device_id && a.symbol === symbol)
     );
     saveData();
-    console.log(`🗑️ Alert Rimosso: ${symbol} per device ${device_id}`);
+    console.log(`🗑️ Alert rimosso: ${symbol}`);
     res.json({ status: "removed" });
 });
 
-app.get("/", (req, res) => {
-    res.send(`Srazu Bot Server Online. Monitorando ${alertsData.active_alerts.length} alert.`);
+// --- VISUALIZZAZIONE JSON (Per te) ---
+app.get("/check", (req, res) => {
+    res.json({
+        server_status: "running",
+        alerts_count: alertsData.active_alerts.length,
+        database: alertsData.active_alerts
+    });
 });
 
-// --- LOGICA DI MONITORAGGIO PREZZI ---
+app.get("/", (req, res) => res.send("🚀 Srazu Backend is Live!"));
 
-async function getPrice(exchange, symbol) {
+// --- LOGICA MONITORAGGIO ---
+
+async function fetchPrice(exchange, symbol) {
     try {
         if (exchange.toLowerCase() === "binance") {
             const r = await axios.get(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`);
             return parseFloat(r.data.price);
         } else {
-            // Default Bybit
             const r = await axios.get(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`);
             return parseFloat(r.data.result.list[0].lastPrice);
         }
     } catch (e) { return null; }
 }
 
-async function checkAlerts() {
+async function checkLoop() {
     if (alertsData.active_alerts.length === 0) return;
 
-    let hasChanged = false;
+    let changed = false;
 
     for (let alert of alertsData.active_alerts) {
         if (alert.triggered) continue;
 
-        const currentPrice = await getPrice(alert.exchange, alert.symbol);
+        const currentPrice = await fetchPrice(alert.exchange, alert.symbol);
         if (!currentPrice) continue;
 
-        // Logica di incrocio: determiniamo la direzione basandoci sul prezzo al momento del set (semplificata)
-        // Se non abbiamo la direzione salvata, usiamo un check standard
-        let isHit = false;
-        
-        // Esempio: Se il prezzo corrente tocca o supera il target
-        // Nota: Nel tuo frontend gestisci crossedUp/Down. Qui il server fa un controllo di soglia.
-        if (Math.abs(currentPrice - alert.price) / alert.price < 0.0005) { // Tolleranza 0.05%
-            isHit = true;
-        } else if (currentPrice >= alert.price && alert.lastPrice < alert.price) {
-             isHit = true;
-        } else if (currentPrice <= alert.price && alert.lastPrice > alert.price) {
-             isHit = true;
+        // Inizializza il lastPrice se è la prima volta
+        if (alert.lastPrice === null) {
+            alert.lastPrice = currentPrice;
+            continue;
         }
-        
-        // Salviamo l'ultimo prezzo per il prossimo check di incrocio
+
+        let isHit = false;
+        // Check incrocio verso l'alto o verso il basso
+        if ((alert.lastPrice < alert.price && currentPrice >= alert.price) ||
+            (alert.lastPrice > alert.price && currentPrice <= alert.price)) {
+            isHit = true;
+        }
+
         alert.lastPrice = currentPrice;
 
         if (isHit) {
-            console.log(`🎯 TARGET RAGGIUNTO: ${alert.symbol} @ ${currentPrice}`);
-            
-            const msg = `🚨 <b>PRICE ALERT!</b>\n` +
-                        `<b>${alert.symbol}</b> ha raggiunto il target!\n` +
-                        `Prezzo: <b>${currentPrice}</b>\n` +
-                        `Exchange: ${alert.exchange.toUpperCase()}`;
+            console.log(`🎯 TARGET RAGGIUNTO: ${alert.symbol}`);
+            const msg = `🚨 <b>PRICE ALERT</b>\n\n` +
+                        `<b>Coppia:</b> ${alert.symbol}\n` +
+                        `<b>Prezzo:</b> ${currentPrice}\n` +
+                        `<b>Target:</b> ${alert.price}\n` +
+                        `<b>Exchange:</b> ${alert.exchange.toUpperCase()}`;
 
-            await sendTelegram(alert.token, alert.chatId, msg);
-            alert.triggered = true;
-            hasChanged = true;
+            const success = await sendTelegram(alert.token, alert.chatId, msg);
+            if (success) {
+                alert.triggered = true;
+                changed = true;
+            }
         }
     }
 
-    // Pulizia: rimuoviamo gli alert scattati per non sprecare risorse
-    if (hasChanged) {
+    if (changed) {
+        // Pulizia: teniamo solo quelli non ancora scattati
         alertsData.active_alerts = alertsData.active_alerts.filter(a => !a.triggered);
         saveData();
     }
@@ -131,30 +141,28 @@ async function checkAlerts() {
 
 async function sendTelegram(token, chatId, text) {
     try {
-        // .trim() rimuove spazi vuoti accidentali all'inizio o alla fine
-        const cleanToken = token.trim(); 
-        const url = `https://api.telegram.org/bot${cleanToken}/sendMessage`;
-        
+        const url = `https://api.telegram.org/bot${token}/sendMessage`;
         await axios.post(url, {
             chat_id: chatId,
             text: text,
             parse_mode: "HTML"
         });
-        console.log("✅ Telegram inviato con successo!");
+        return true;
     } catch (e) {
-        // Se l'errore persiste, stampiamo l'URL (senza token completo) per capire
-        console.error(`❌ Errore API Telegram: ${e.response ? e.response.statusText : e.message}`);
-        if (e.response && e.response.status === 404) {
-            console.error("⚠️ Il Token Bot sembra non essere valido. Controllalo su @BotFather.");
-        }
+        console.error(`❌ Telegram Error: ${e.response ? e.response.statusText : e.message}`);
+        return false;
     }
 }
 
 function saveData() {
-    fs.writeFileSync(ALERT_FILE, JSON.stringify(alertsData, null, 2));
+    try {
+        fs.writeFileSync(ALERT_FILE, JSON.stringify(alertsData, null, 2));
+    } catch (e) {
+        console.error("❌ Errore salvataggio:", e.message);
+    }
 }
 
-// Ciclo di controllo ogni 5 secondi
-setInterval(checkAlerts, 5000);
+// Avvio Loop (Ogni 5 secondi)
+setInterval(checkLoop, 5000);
 
-app.listen(PORT, () => console.log(`🚀 Server per Render pronto sulla porta ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server pronto sulla porta ${PORT}`));
