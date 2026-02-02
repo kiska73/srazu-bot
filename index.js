@@ -1,85 +1,98 @@
-import fs from "fs";
 import fetch from "node-fetch";
+import fs from "fs";
 
-const ALERTS_FILE = "./alerts.json";
+const ALERT_FILE = "./alerts.json"; // file JSON con alert
+const INTERVAL = 5000; // 5 secondi
 
 // Legge gli alert dal JSON
 function loadAlerts() {
-  if (!fs.existsSync(ALERTS_FILE)) return [];
-  const data = fs.readFileSync(ALERTS_FILE);
-  const json = JSON.parse(data);
-  return json.alerts || [];
-}
-
-// Salva gli alert aggiornati
-function saveAlerts(alerts) {
-  fs.writeFileSync(ALERTS_FILE, JSON.stringify({ alerts }, null, 2));
-}
-
-// Invia messaggio Telegram usando il bot_token dal JSON
-async function sendTelegram(chat_id, text, bot_token) {
+  if (!fs.existsSync(ALERT_FILE)) return [];
+  const data = fs.readFileSync(ALERT_FILE, "utf8");
   try {
-    const url = `https://api.telegram.org/bot${bot_token}/sendMessage`;
-    const res = await fetch(url, {
+    return JSON.parse(data).alerts || [];
+  } catch (err) {
+    console.error("Errore parsing JSON:", err);
+    return [];
+  }
+}
+
+// Salva gli alert aggiornati nel JSON
+function saveAlerts(alerts) {
+  fs.writeFileSync(ALERT_FILE, JSON.stringify({ alerts }, null, 2));
+}
+
+// Funzione per inviare messaggio Telegram usando il bot token dell'alert
+async function sendTelegram(chat_id, text, bot_token) {
+  const url = `https://api.telegram.org/bot${bot_token}/sendMessage`;
+  try {
+    await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id, text }),
     });
-    return res.json();
   } catch (err) {
-    console.error("Errore Telegram:", err);
+    console.error("Errore invio Telegram:", err);
   }
 }
 
-// Ottiene il prezzo corrente di una coppia da Binance
-async function getPriceBinance(symbol) {
+// Funzione per ottenere i prezzi attuali da Binance
+async function getPrices(symbols) {
+  const prices = {};
   try {
-    const url = `https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`;
-    const res = await fetch(url);
+    // Binance API pubblica
+    const query = symbols.map(s => `symbol=${s.toUpperCase()}`).join("&");
+    const res = await fetch(`https://api.binance.com/api/v3/ticker/price?${query}`);
     const data = await res.json();
-    return parseFloat(data.price);
+
+    if (Array.isArray(data)) {
+      data.forEach(item => {
+        prices[item.symbol] = parseFloat(item.price);
+      });
+    } else if (data.symbol && data.price) {
+      prices[data.symbol] = parseFloat(data.price);
+    }
   } catch (err) {
-    console.error(`Errore Binance per ${symbol}:`, err);
-    return null;
+    console.error("Errore fetch prezzi:", err);
   }
+  return prices;
 }
 
-// Loop di controllo alert
+// Funzione principale che controlla gli alert
 async function checkAlerts() {
-  const alerts = loadAlerts();
+  let alerts = loadAlerts();
   if (alerts.length === 0) return;
 
-  // Creiamo un set delle coppie per fare richieste singole
-  const symbols = [...new Set(alerts.map(a => a.symbol))];
+  // Trova tutte le coppie attive
+  const symbols = [...new Set(alerts.map(a => a.symbol.toUpperCase()))];
 
-  // Scarica il prezzo solo per le coppie interessate
-  const prices = {};
-  await Promise.all(
-    symbols.map(async (s) => {
-      const p = await getPriceBinance(s);
-      if (p !== null) prices[s] = p;
-    })
-  );
+  // Scarica solo prezzi necessari
+  const prices = await getPrices(symbols);
 
-  // Controlla gli alert
   for (const alert of [...alerts]) {
-    const currentPrice = prices[alert.symbol];
+    const symbol = alert.symbol.toUpperCase();
+    const currentPrice = prices[symbol];
+
     if (!currentPrice) continue;
 
-    if (currentPrice >= alert.price) {
-      const msg = `⚡ Alert! ${alert.symbol} ha raggiunto ${currentPrice}`;
+    // Controllo sopra/sotto
+    if (
+      (alert.type === "above" && currentPrice >= alert.price) ||
+      (alert.type === "below" && currentPrice <= alert.price)
+    ) {
+      const msg = `⚡ Alert! ${symbol} ha raggiunto ${currentPrice} (soglia ${alert.price})`;
       await sendTelegram(alert.user_id, msg, alert.bot_token);
-      console.log(msg);
 
       // Rimuove alert inviato
-      const index = alerts.indexOf(alert);
-      if (index > -1) alerts.splice(index, 1);
-      saveAlerts(alerts);
+      alerts = alerts.filter(a => a !== alert);
     }
   }
+
+  // Salva alert aggiornati
+  saveAlerts(alerts);
 }
 
-// Loop infinito ogni 5 secondi
-setInterval(checkAlerts, 5000);
+// Loop infinito ogni INTERVAL ms
+setInterval(checkAlerts, INTERVAL);
 
-console.log("Server price alert attivo ✅");
+// Avvio immediato
+checkAlerts();
