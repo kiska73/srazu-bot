@@ -1,98 +1,107 @@
-import fetch from "node-fetch";
-import fs from "fs";
+import fs from 'fs';
+import axios from 'axios';
 
-const ALERT_FILE = "./alerts.json"; // file JSON con alert
-const INTERVAL = 5000; // 5 secondi
+const ALERT_FILE = './alerts.json';
+const POLL_INTERVAL = 5000; // 5 secondi
+let alerts = [];
 
-// Legge gli alert dal JSON
+// Carica gli alert dal file
 function loadAlerts() {
-  if (!fs.existsSync(ALERT_FILE)) return [];
-  const data = fs.readFileSync(ALERT_FILE, "utf8");
   try {
-    return JSON.parse(data).alerts || [];
+    const data = fs.readFileSync(ALERT_FILE);
+    alerts = JSON.parse(data);
+    console.log(`⚡ ${alerts.length} alerts caricati`);
   } catch (err) {
-    console.error("Errore parsing JSON:", err);
-    return [];
+    console.error('Errore caricando alerts.json:', err);
   }
 }
 
-// Salva gli alert aggiornati nel JSON
-function saveAlerts(alerts) {
-  fs.writeFileSync(ALERT_FILE, JSON.stringify({ alerts }, null, 2));
+// Salva gli alert aggiornati (per triggered)
+function saveAlerts() {
+  fs.writeFileSync(ALERT_FILE, JSON.stringify(alerts, null, 2));
 }
 
-// Funzione per inviare messaggio Telegram usando il bot token dell'alert
-async function sendTelegram(chat_id, text, bot_token) {
-  const url = `https://api.telegram.org/bot${bot_token}/sendMessage`;
+// Fetch prezzi Binance
+async function fetchBinance(symbol) {
   try {
-    await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id, text }),
-    });
+    const res = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
+    return parseFloat(res.data.price);
   } catch (err) {
-    console.error("Errore invio Telegram:", err);
+    console.error('Errore Binance', symbol, err.message);
+    return null;
   }
 }
 
-// Funzione per ottenere i prezzi attuali da Binance
-async function getPrices(symbols) {
-  const prices = {};
+// Fetch prezzi Bybit
+async function fetchBybit(symbol) {
   try {
-    // Binance API pubblica
-    const query = symbols.map(s => `symbol=${s.toUpperCase()}`).join("&");
-    const res = await fetch(`https://api.binance.com/api/v3/ticker/price?${query}`);
-    const data = await res.json();
-
-    if (Array.isArray(data)) {
-      data.forEach(item => {
-        prices[item.symbol] = parseFloat(item.price);
-      });
-    } else if (data.symbol && data.price) {
-      prices[data.symbol] = parseFloat(data.price);
+    const res = await axios.get(`https://api.bybit.com/v2/public/tickers?symbol=${symbol}`);
+    if (res.data.result && res.data.result.length > 0) {
+      return parseFloat(res.data.result[0].last_price);
     }
+    return null;
   } catch (err) {
-    console.error("Errore fetch prezzi:", err);
+    console.error('Errore Bybit', symbol, err.message);
+    return null;
   }
+}
+
+// Fetch solo i simboli necessari
+async function fetchPrices() {
+  const prices = {};
+  const grouped = {};
+
+  for (const alert of alerts) {
+    if (alert.triggered) continue; // salta quelli già triggerati
+    const key = `${alert.exchange}:${alert.symbol}`;
+    grouped[key] = alert;
+  }
+
+  await Promise.all(Object.keys(grouped).map(async (key) => {
+    const [exchange, symbol] = key.split(':');
+    let price = null;
+    if (exchange === 'binance') price = await fetchBinance(symbol);
+    if (exchange === 'bybit') price = await fetchBybit(symbol);
+    if (price !== null) prices[key] = price;
+  }));
+
   return prices;
 }
 
-// Funzione principale che controlla gli alert
-async function checkAlerts() {
-  let alerts = loadAlerts();
-  if (alerts.length === 0) return;
+// Controlla alert e aggiorna triggered
+function checkAlerts(prices) {
+  let triggeredSomething = false;
 
-  // Trova tutte le coppie attive
-  const symbols = [...new Set(alerts.map(a => a.symbol.toUpperCase()))];
+  for (const alert of alerts) {
+    if (alert.triggered) continue;
 
-  // Scarica solo prezzi necessari
-  const prices = await getPrices(symbols);
+    const key = `${alert.exchange}:${alert.symbol}`;
+    const current = prices[key];
+    if (current === undefined) continue;
 
-  for (const alert of [...alerts]) {
-    const symbol = alert.symbol.toUpperCase();
-    const currentPrice = prices[symbol];
-
-    if (!currentPrice) continue;
-
-    // Controllo sopra/sotto
-    if (
-      (alert.type === "above" && currentPrice >= alert.price) ||
-      (alert.type === "below" && currentPrice <= alert.price)
-    ) {
-      const msg = `⚡ Alert! ${symbol} ha raggiunto ${currentPrice} (soglia ${alert.price})`;
-      await sendTelegram(alert.user_id, msg, alert.bot_token);
-
-      // Rimuove alert inviato
-      alerts = alerts.filter(a => a !== alert);
+    if (alert.type === 'above' && current >= alert.price) {
+      console.log(`🚨 [${alert.exchange}] ${alert.symbol} sopra ${alert.price}! Prezzo attuale: ${current}`);
+      alert.triggered = true;
+      triggeredSomething = true;
+    } else if (alert.type === 'below' && current <= alert.price) {
+      console.log(`🚨 [${alert.exchange}] ${alert.symbol} sotto ${alert.price}! Prezzo attuale: ${current}`);
+      alert.triggered = true;
+      triggeredSomething = true;
     }
   }
 
-  // Salva alert aggiornati
-  saveAlerts(alerts);
+  if (triggeredSomething) saveAlerts();
 }
 
-// Loop infinito ogni INTERVAL ms
-setInterval(checkAlerts, INTERVAL);
+// Loop principale
+async function main() {
+  loadAlerts();
+  console.log('Server price alert attivo ✅');
 
-// Avvio immediato
-checkAlerts();
+  setInterval(async () => {
+    const prices = await fetchPrices();
+    checkAlerts(prices);
+  }, POLL_INTERVAL);
+}
+
+main();
