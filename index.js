@@ -66,7 +66,7 @@ async function sendTelegram(token, chatId, text) {
 }
 
 app.post("/set_alert", (req, res) => {
-    const { device_id, exchange, symbol, price, direction, tgToken, tgChatId } = req.body;
+    const { device_id, exchange, symbol, price, tgToken, tgChatId } = req.body;
     
     if (!tgToken || !tgChatId) {
         return res.status(400).json({ ok: false, error: "Missing Telegram Token or ChatID" });
@@ -79,7 +79,6 @@ app.post("/set_alert", (req, res) => {
         exchange: exchange.toLowerCase(),
         symbol: symbol.toUpperCase(),
         price: Number(price),
-        direction,
         tgToken,
         tgChatId,
         triggered: false,
@@ -89,7 +88,7 @@ app.post("/set_alert", (req, res) => {
     alerts.push(newAlert);
     saveAlerts(alerts);
     
-    console.log(`✅ Alert set: ${newAlert.symbol} at ${newAlert.price} (${direction})`);
+    console.log(`✅ Alert set: ${newAlert.symbol} at ${newAlert.price}`);
     res.json({ ok: true });
 });
 
@@ -120,8 +119,8 @@ setInterval(async () => {
         const currentPrice = await getLastPrice(alert.exchange, alert.symbol);
         if (!currentPrice) continue;
 
-        const isHit = (alert.direction === "up" && currentPrice >= alert.price) ||
-                      (alert.direction === "down" && currentPrice <= alert.price);
+        // Trigger semplice: se prezzo attuale supera o scende sotto il target
+        const isHit = currentPrice >= alert.price || currentPrice <= alert.price;
 
         if (isHit) {
             console.log(`🎯 TARGET HIT: ${alert.symbol} at ${currentPrice}`);
