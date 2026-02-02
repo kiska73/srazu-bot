@@ -2,55 +2,81 @@ const fs = require("fs");
 const axios = require("axios");
 const express = require("express");
 
-// CONFIGURAZIONE
+// --- CONFIGURAZIONE ---
 const ALERT_FILE = "./alerts.json";
-const CHECK_INTERVAL = 5000; // 5 secondi
+const CHECK_INTERVAL = 5000; // Controlla i prezzi ogni 5 secondi
 const PORT = process.env.PORT || 3000;
 
-// Variabile globale per i dati
+// Variabile in memoria che conterrà i dati del JSON
 let alertsData = { telegram: {}, alerts: [] };
 
-// --- 1. SETUP SERVER WEB (Per Render) ---
+// --- 1. SERVER WEB (Obbligatorio per Render) ---
 const app = express();
+
 app.get("/", (req, res) => {
-  res.send("Crypto Alert Bot è attivo! 🚀");
+  // Mostra a schermo se il bot sta girando e quanti alert ha caricato
+  const alertCount = alertsData.alerts ? alertsData.alerts.length : 0;
+  res.send(`
+    <h1>🤖 Bot Alert Crypto Attivo</h1>
+    <p>Alert caricati dal JSON: <strong>${alertCount}</strong></p>
+    <p>Stato server: Online ✅</p>
+  `);
 });
+
 app.listen(PORT, () => {
-  console.log(`🌍 Web Server in ascolto sulla porta ${PORT}`);
+  console.log(`🌍 Server web avviato sulla porta ${PORT}`);
 });
 
 // --- 2. GESTIONE FILE JSON ---
+
 function loadAlerts() {
   try {
     if (!fs.existsSync(ALERT_FILE)) {
-      console.error("❌ File alerts.json non trovato!");
+      console.error("❌ ERRORE CRITICO: Il file alerts.json non esiste!");
       return;
     }
+    
+    // Legge il file in modo sincrono all'avvio
     const raw = fs.readFileSync(ALERT_FILE);
     const data = JSON.parse(raw);
+    
+    // Aggiorna la variabile globale
     alertsData = data;
-    console.log(`⚡ ${alertsData.alerts.length} alerts caricati correttamente.`);
+    
+    console.log("📂 JSON caricato correttamente.");
+    
+    // Verifica presenza credenziali (senza stamparle per sicurezza)
+    if (!alertsData.telegram || !alertsData.telegram.token || !alertsData.telegram.chatId) {
+      console.warn("⚠️ ATTENZIONE: Token o ChatID mancanti nel file JSON!");
+    } else {
+      console.log("✅ Credenziali Telegram rilevate.");
+    }
+    
+    console.log(`📊 Trovati ${alertsData.alerts.length} alert da monitorare.`);
+    
   } catch (e) {
-    console.error("❌ Errore caricamento JSON:", e.message);
+    console.error("❌ Errore durante la lettura del JSON:", e.message);
   }
 }
 
 function saveAlerts() {
   try {
-    // Salviamo lo stato (es. triggered: true) nel file
+    // Sovrascrive il file JSON con i dati aggiornati (es. triggered: true)
     fs.writeFileSync(ALERT_FILE, JSON.stringify(alertsData, null, 2));
-    // console.log("💾 Stato alerts salvato.");
+    // console.log("💾 Stato alert salvato su file.");
   } catch (e) {
     console.error("❌ Errore salvataggio JSON:", e.message);
   }
 }
 
-// --- 3. FUNZIONI API & TELEGRAM ---
+// --- 3. FUNZIONI ESTERNE (Telegram & Binance) ---
 
 async function sendTelegram(message) {
+  // Prende i dati DINAMICAMENTE dalla variabile caricata dal JSON
   const { token, chatId } = alertsData.telegram;
+
   if (!token || !chatId) {
-    console.log("⚠️ Configurazione Telegram mancante.");
+    console.error("⚠️ Impossibile inviare Telegram: Token o ChatID assenti.");
     return;
   }
 
@@ -60,96 +86,76 @@ async function sendTelegram(message) {
       text: message,
       parse_mode: "Markdown"
     });
-    console.log(`📩 Telegram inviato: ${message}`);
+    console.log(`📩 Messaggio inviato: "${message}"`);
   } catch (e) {
-    console.error(`❌ Errore invio Telegram: ${e.response ? e.response.data.description : e.message}`);
+    console.error(`❌ Errore API Telegram: ${e.response ? e.response.data.description : e.message}`);
   }
 }
 
-// Supporto API Binance (Più stabile per i prezzi spot)
 async function getBinancePrice(symbol) {
   try {
-    // Normalizza il simbolo (es. btcusdt -> BTCUSDT)
     const upperSymbol = symbol.toUpperCase();
     const resp = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${upperSymbol}`);
     return parseFloat(resp.data.price);
   } catch (e) {
-    console.error(`⚠️ Errore prezzo Binance per ${symbol}:`, e.message);
+    console.error(`⚠️ Errore Binance per ${symbol}:`, e.message);
     return null;
   }
-}
-
-// Supporto API Bybit (Opzionale, se vuoi usare Bybit scommenta la logica in checkAlerts)
-async function getBybitPrice(symbol) {
-    try {
-        const upperSymbol = symbol.toUpperCase();
-        const resp = await axios.get(`https://api.bybit.com/v5/market/tickers?category=spot&symbol=${upperSymbol}`);
-        if(resp.data.retCode === 0 && resp.data.result.list.length > 0) {
-            return parseFloat(resp.data.result.list[0].lastPrice);
-        }
-        return null;
-    } catch (e) {
-        console.error(`⚠️ Errore prezzo Bybit per ${symbol}:`, e.message);
-        return null;
-    }
 }
 
 // --- 4. LOGICA DI CONTROLLO ---
 
 async function checkAlerts() {
-  // Ricarica il JSON ogni volta per vedere se hai aggiunto nuovi alert manualmente
-  // Nota: Su Render il filesystem è effimero, quindi se riavvii perdi le modifiche fatte via codice, 
-  // ma se carichi un nuovo file da Git va bene.
-  // Se non modifichi il file esternamente mentre gira, puoi commentare la riga sotto:
-  // loadAlerts(); 
-
-  if (!alertsData.alerts || alertsData.alerts.length === 0) {
-    return; // Nessun alert da controllare
-  }
+  // Se non ci sono alert nel JSON, non fa nulla
+  if (!alertsData.alerts || alertsData.alerts.length === 0) return;
 
   let stateChanged = false;
 
   for (const alert of alertsData.alerts) {
-    // Salta se già scattato
+    // 1. Salta se l'alert è già stato inviato
     if (alert.triggered) continue;
 
-    // Ottieni prezzo (Usa Binance di default)
+    // 2. Ottieni prezzo corrente
     const currentPrice = await getBinancePrice(alert.symbol);
-    
     if (currentPrice === null) continue;
 
     let triggered = false;
     let icon = "";
+    let message = "";
 
-    // Logica ABOVE (Prezzo sale sopra X)
+    // 3. Controlla le condizioni scritte nel JSON
+    
+    // Condizione "above" (Sopra)
     if (alert.direction === "above" && currentPrice >= alert.price) {
       triggered = true;
       icon = "🚀";
-      await sendTelegram(`${icon} **ALERT PREZZO**\n\n💎 **${alert.symbol}** ha superato ${alert.price}\n💰 Prezzo Attuale: ${currentPrice}`);
+      message = `${icon} **TARGET RAGGIUNTO**\n\n💎 **${alert.symbol}**\n💰 Prezzo: ${currentPrice}\n🎯 Target: > ${alert.price}`;
     } 
-    // Logica BELOW (Prezzo scende sotto X)
+    // Condizione "below" (Sotto)
     else if (alert.direction === "below" && currentPrice <= alert.price) {
       triggered = true;
       icon = "🔻";
-      await sendTelegram(`${icon} **ALERT PREZZO**\n\n💎 **${alert.symbol}** è sceso sotto ${alert.price}\n💰 Prezzo Attuale: ${currentPrice}`);
+      message = `${icon} **DUMP ALERT**\n\n💎 **${alert.symbol}**\n💰 Prezzo: ${currentPrice}\n🎯 Target: < ${alert.price}`;
     }
 
+    // 4. Se la condizione è vera, invia e aggiorna
     if (triggered) {
-      alert.triggered = true;
-      stateChanged = true;
+      await sendTelegram(message);
+      alert.triggered = true; // Segna come fatto
+      stateChanged = true;    // Segna che dobbiamo salvare il file
     }
   }
 
-  // Se qualche alert è scattato, salviamo il file JSON per non reinviare il messaggio
+  // 5. Se abbiamo inviato messaggi, aggiorniamo il file JSON
   if (stateChanged) {
     saveAlerts();
   }
 }
 
-// --- 5. AVVIO ---
+// --- 5. START ---
 
-console.log("🤖 Bot Alert Crypto Avviato...");
-loadAlerts();
+console.log("🚀 Avvio Bot Crypto Alert...");
+loadAlerts(); // Carica i dati dal JSON
 
-// Esegui controllo ogni X millisecondi
+// Avvia il loop di controllo
 setInterval(checkAlerts, CHECK_INTERVAL);
