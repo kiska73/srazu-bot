@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 3000;
 
 const ALERT_FILE = "./alerts.json";
 
+// Carica gli alert esistenti dal file
 function loadAlerts() {
     try {
         if (!fs.existsSync(ALERT_FILE)) return [];
@@ -21,6 +22,7 @@ function loadAlerts() {
     }
 }
 
+// Salva gli alert aggiornati nel file
 function saveAlerts(alerts) {
     try {
         fs.writeFileSync(ALERT_FILE, JSON.stringify(alerts, null, 2));
@@ -29,6 +31,7 @@ function saveAlerts(alerts) {
     }
 }
 
+// Ottieni l'ultimo prezzo di mercato da Bybit o Binance
 async function getLastPrice(exchange, symbol) {
     try {
         if (exchange === "bybit") {
@@ -51,6 +54,7 @@ async function getLastPrice(exchange, symbol) {
     return null;
 }
 
+// Funzione per inviare un messaggio Telegram
 async function sendTelegram(token, chatId, text) {
     const baseUrl = `https://api.telegram.org/bot${token}`;
     try {
@@ -65,11 +69,13 @@ async function sendTelegram(token, chatId, text) {
     }
 }
 
+// Endpoint per settare un alert
 app.post("/set_alert", (req, res) => {
-    const { device_id, exchange, symbol, price, tgToken, tgChatId } = req.body;
+    const { device_id, exchange, symbol, price, tgToken, tgChatId, direction } = req.body;
     
-    if (!tgToken || !tgChatId) {
-        return res.status(400).json({ ok: false, error: "Missing Telegram Token or ChatID" });
+    // Controllo di validità input
+    if (!tgToken || !tgChatId || !exchange || !symbol || !price || !direction) {
+        return res.status(400).json({ ok: false, error: "Missing required fields" });
     }
 
     let alerts = loadAlerts();
@@ -79,6 +85,7 @@ app.post("/set_alert", (req, res) => {
         exchange: exchange.toLowerCase(),
         symbol: symbol.toUpperCase(),
         price: Number(price),
+        direction, // direction = "above" or "below"
         tgToken,
         tgChatId,
         triggered: false,
@@ -88,16 +95,17 @@ app.post("/set_alert", (req, res) => {
     alerts.push(newAlert);
     saveAlerts(alerts);
     
-    console.log(`✅ Alert set: ${newAlert.symbol} at ${newAlert.price}`);
+    console.log(`✅ Alert set: ${newAlert.symbol} at ${newAlert.price}, direction: ${newAlert.direction}`);
     res.json({ ok: true });
 });
 
+// Endpoint per rimuovere un alert
 app.post("/remove_alert", (req, res) => {
     let alerts = loadAlerts();
     const initialCount = alerts.length;
 
     alerts = alerts.filter(a => 
-        !(a.device_id === req.body.device_id && a.symbol === req.body.symbol)
+        !(a.device_id === req.body.device_id && a.symbol === req.body.symbol && a.exchange === req.body.exchange)
     );
 
     if (alerts.length !== initialCount) {
@@ -107,6 +115,7 @@ app.post("/remove_alert", (req, res) => {
     res.json({ ok: true });
 });
 
+// Funzione per controllare gli alert ogni 5 secondi
 setInterval(async () => {
     let alerts = loadAlerts();
     if (alerts.length === 0) return;
@@ -114,13 +123,18 @@ setInterval(async () => {
     let changed = false;
 
     for (let alert of alerts) {
-        if (alert.triggered) continue;
+        if (alert.triggered) continue; // Se l'alert è già stato attivato, salta
 
         const currentPrice = await getLastPrice(alert.exchange, alert.symbol);
         if (!currentPrice) continue;
 
-        // Trigger semplice: se prezzo attuale supera o scende sotto il target
-        const isHit = currentPrice >= alert.price || currentPrice <= alert.price;
+        // Log per vedere i prezzi
+        console.log(`[CHECK] ${alert.symbol} | target=${alert.price} | current=${currentPrice}`);
+
+        // Verifica se il prezzo ha raggiunto il target (in base alla direction)
+        const isHit =
+            (alert.direction === "above" && currentPrice >= alert.price) ||
+            (alert.direction === "below" && currentPrice <= alert.price);
 
         if (isHit) {
             console.log(`🎯 TARGET HIT: ${alert.symbol} at ${currentPrice}`);
@@ -145,6 +159,7 @@ setInterval(async () => {
         }
     }
 
+    // Se ci sono stati cambiamenti, aggiorna il file con gli alert non ancora attivati
     if (changed) {
         const remainingAlerts = alerts.filter(a => !a.triggered);
         saveAlerts(remainingAlerts);
@@ -152,6 +167,7 @@ setInterval(async () => {
     }
 }, 5000);
 
+// Avvia il server
 app.listen(PORT, () => {
     console.log(`🚀 Alert Server running on port ${PORT}`);
     console.log(`📂 Alert file: ${path.resolve(ALERT_FILE)}`);
