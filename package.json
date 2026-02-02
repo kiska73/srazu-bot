@@ -8,9 +8,6 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "node-fetch": "^3.3.2",
-    "chartjs-node-canvas": "^4.1.6",
-    "canvas": "^2.11.2"
+    "node-fetch": "^3.3.2"
   }
 }
-
