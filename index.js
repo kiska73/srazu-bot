@@ -7,168 +7,161 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-
 const ALERT_FILE = "./alerts.json";
 
-// Carica gli alert esistenti dal file
+// Telegram BOT token (Render ENV)
+const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
+if (!TG_BOT_TOKEN) {
+    console.error("❌ TG_BOT_TOKEN missing in ENV");
+    process.exit(1);
+}
+
+/* ================= FILE UTILS ================= */
+
 function loadAlerts() {
     try {
         if (!fs.existsSync(ALERT_FILE)) return [];
-        const data = fs.readFileSync(ALERT_FILE, "utf8");
-        return JSON.parse(data);
-    } catch (e) {
-        console.error("❌ Error reading alerts.json:", e.message);
+        return JSON.parse(fs.readFileSync(ALERT_FILE, "utf8"));
+    } catch {
         return [];
     }
 }
 
-// Salva gli alert aggiornati nel file
 function saveAlerts(alerts) {
-    try {
-        fs.writeFileSync(ALERT_FILE, JSON.stringify(alerts, null, 2));
-    } catch (e) {
-        console.error("❌ Error saving alerts.json:", e.message);
-    }
+    fs.writeFileSync(ALERT_FILE, JSON.stringify(alerts, null, 2));
 }
 
-// Ottieni l'ultimo prezzo di mercato da Bybit o Binance
+/* ================= PRICE FETCH ================= */
+
 async function getLastPrice(exchange, symbol) {
     try {
         if (exchange === "bybit") {
-            const r = await fetch(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`);
+            const r = await fetch(
+                `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`
+            );
             const j = await r.json();
-            if (j.result?.list?.[0]?.lastPrice) {
-                return Number(j.result.list[0].lastPrice);
-            }
+            return Number(j?.result?.list?.[0]?.lastPrice || 0);
         }
+
         if (exchange === "binance") {
-            const r = await fetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`);
+            const r = await fetch(
+                `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`
+            );
             const j = await r.json();
-            if (j.price) {
-                return Number(j.price);
-            }
+            return Number(j?.price || 0);
         }
     } catch (e) {
-        console.error(`⚠️ Error fetching ${exchange} for ${symbol}:`, e.message);
+        console.error("Price fetch error:", e.message);
     }
-    return null;
+    return 0;
 }
 
-// Funzione per inviare un messaggio Telegram
-async function sendTelegram(token, chatId, text) {
-    const baseUrl = `https://api.telegram.org/bot${token}`;
+/* ================= TELEGRAM ================= */
+
+async function sendTelegram(chatId, text) {
     try {
-        const url = `${baseUrl}/sendMessage?chat_id=${chatId}&text=${encodeURIComponent(text)}&parse_mode=HTML`;
+        const url =
+            `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage` +
+            `?chat_id=${chatId}&parse_mode=HTML&text=${encodeURIComponent(text)}`;
+
         const r = await fetch(url);
-        const res = await r.json();
-        if (!res.ok) throw new Error(res.description);
-        return true;
-    } catch (e) {
-        console.error("❌ Error sending Telegram:", e.message);
+        const j = await r.json();
+        return j.ok;
+    } catch {
         return false;
     }
 }
 
-// Endpoint per settare un alert
-app.post("/set_alert", (req, res) => {
-    const { device_id, exchange, symbol, price, tgToken, tgChatId, direction } = req.body;
-    
-    // Controllo di validità input
-    if (!tgToken || !tgChatId || !exchange || !symbol || !price || !direction) {
-        return res.status(400).json({ ok: false, error: "Missing required fields" });
+/* ================= ROUTES ================= */
+
+// compatibile con la tua app
+app.post("/add_alert", (req, res) => {
+    const { device_id, exchange, symbol, price, chat_id } = req.body;
+
+    if (!device_id || !exchange || !symbol || !price || !chat_id) {
+        return res.status(400).json({ ok: false });
     }
 
-    let alerts = loadAlerts();
-    
-    const newAlert = {
+    const alerts = loadAlerts();
+
+    alerts.push({
         device_id,
         exchange: exchange.toLowerCase(),
         symbol: symbol.toUpperCase(),
         price: Number(price),
-        direction, // direction = "above" or "below"
-        tgToken,
-        tgChatId,
-        triggered: false,
+        chat_id,
         created: Date.now()
-    };
+    });
 
-    alerts.push(newAlert);
     saveAlerts(alerts);
-    
-    console.log(`✅ Alert set: ${newAlert.symbol} at ${newAlert.price}, direction: ${newAlert.direction}`);
+    console.log(`✅ ALERT ADDED ${symbol} @ ${price}`);
     res.json({ ok: true });
 });
 
-// Endpoint per rimuovere un alert
 app.post("/remove_alert", (req, res) => {
-    let alerts = loadAlerts();
-    const initialCount = alerts.length;
+    const { device_id, symbol, exchange } = req.body;
 
-    alerts = alerts.filter(a => 
-        !(a.device_id === req.body.device_id && a.symbol === req.body.symbol && a.exchange === req.body.exchange)
+    let alerts = loadAlerts();
+    const before = alerts.length;
+
+    alerts = alerts.filter(
+        a =>
+            !(
+                a.device_id === device_id &&
+                a.symbol === symbol &&
+                a.exchange === exchange
+            )
     );
 
-    if (alerts.length !== initialCount) {
-        saveAlerts(alerts);
-        console.log(`🗑️ Alert removed for ${req.body.symbol}`);
-    }
+    if (alerts.length !== before) saveAlerts(alerts);
     res.json({ ok: true });
 });
 
-// Funzione per controllare gli alert ogni 5 secondi
+/* ================= ALERT LOOP ================= */
+
 setInterval(async () => {
     let alerts = loadAlerts();
-    if (alerts.length === 0) return;
+    if (!alerts.length) return;
 
     let changed = false;
 
-    for (let alert of alerts) {
-        if (alert.triggered) continue; // Se l'alert è già stato attivato, salta
+    for (const alert of alerts) {
+        const price = await getLastPrice(alert.exchange, alert.symbol);
+        if (!price) continue;
 
-        const currentPrice = await getLastPrice(alert.exchange, alert.symbol);
-        if (!currentPrice) continue;
+        // trigger semplice (come vuoi tu)
+        if (price >= alert.price || price <= alert.price) {
+            console.log(`🎯 HIT ${alert.symbol} ${price}`);
 
-        // Log per vedere i prezzi
-        console.log(`[CHECK] ${alert.symbol} | target=${alert.price} | current=${currentPrice}`);
+            const tradeUrl =
+                alert.exchange === "bybit"
+                    ? `https://www.bybit.com/trade/usdt/${alert.symbol}`
+                    : `https://www.binance.com/en/futures/${alert.symbol}`;
 
-        // Verifica se il prezzo ha raggiunto il target (in base alla direction)
-        const isHit =
-            (alert.direction === "above" && currentPrice >= alert.price) ||
-            (alert.direction === "below" && currentPrice <= alert.price);
+            const msg =
+                `🚨 <b>PRICE ALERT</b>\n\n` +
+                `<b>${alert.symbol}</b>\n` +
+                `Target: ${alert.price}\n` +
+                `Current: ${price}\n\n` +
+                `<a href="${tradeUrl}">OPEN TRADE</a>`;
 
-        if (isHit) {
-            console.log(`🎯 TARGET HIT: ${alert.symbol} at ${currentPrice}`);
-
-            const exchangeUrl = alert.exchange === "bybit" 
-                ? `https://www.bybit.com/trade/usdt/${alert.symbol}`
-                : `https://www.binance.com/en/futures/${alert.symbol}`;
-
-            const message = `🚨 <b>PRICE ALERT</b>\n\n` +
-                          `<b>Asset:</b> ${alert.symbol}\n` +
-                          `<b>Target:</b> ${alert.price}\n` +
-                          `<b>Current Price:</b> ${currentPrice}\n` +
-                          `<b>Exchange:</b> ${alert.exchange.toUpperCase()}\n\n` +
-                          `<a href="${exchangeUrl}">👉 OPEN TRADE</a>`;
-
-            const success = await sendTelegram(alert.tgToken, alert.tgChatId, message);
-            
-            if (success) {
-                alert.triggered = true;
+            const ok = await sendTelegram(alert.chat_id, msg);
+            if (ok) {
+                alert._done = true;
                 changed = true;
             }
         }
     }
 
-    // Se ci sono stati cambiamenti, aggiorna il file con gli alert non ancora attivati
     if (changed) {
-        const remainingAlerts = alerts.filter(a => !a.triggered);
-        saveAlerts(remainingAlerts);
-        console.log("🧹 alerts.json updated and cleaned.");
+        alerts = alerts.filter(a => !a._done);
+        saveAlerts(alerts);
     }
 }, 5000);
 
-// Avvia il server
+/* ================= START ================= */
+
 app.listen(PORT, () => {
-    console.log(`🚀 Alert Server running on port ${PORT}`);
-    console.log(`📂 Alert file: ${path.resolve(ALERT_FILE)}`);
+    console.log(`🚀 Server running on ${PORT}`);
+    console.log(`📂 alerts.json → ${path.resolve(ALERT_FILE)}`);
 });
