@@ -3,7 +3,6 @@ const axios = require("axios");
 const express = require("express");
 const cors = require("cors");
 
-// Configurazione Percorso File (Usa il Volume /data su Render o cartella locale)
 const ALERT_FILE = process.env.RENDER ? "/data/alerts.json" : "./alerts.json";
 const PORT = process.env.PORT || 3000;
 
@@ -13,58 +12,59 @@ app.use(express.json());
 
 let alertsData = { active_alerts: [] };
 
-// --- CARICAMENTO DATI ---
 function loadData() {
     try {
         if (fs.existsSync(ALERT_FILE)) {
             const raw = fs.readFileSync(ALERT_FILE, "utf8");
             alertsData = JSON.parse(raw);
-            // Assicuriamoci che la struttura sia corretta
             if (!alertsData.active_alerts) alertsData.active_alerts = [];
             console.log(`📂 Database caricato. Alert attivi: ${alertsData.active_alerts.length}`);
         } else {
-            console.log("🆕 File JSON non trovato. Ne verrà creato uno al primo alert.");
+            console.log("🆕 File JSON non trovato. Creazione nuovo.");
             saveData();
         }
     } catch (e) {
-        console.error("❌ Errore inizializzazione JSON:", e.message);
+        console.error("❌ Errore caricamento JSON:", e.message);
         alertsData = { active_alerts: [] };
     }
 }
 
-// --- FUNZIONE DI SALVATAGGIO ---
 function saveData() {
     try {
         fs.writeFileSync(ALERT_FILE, JSON.stringify(alertsData, null, 2));
     } catch (e) {
-        console.error("❌ Errore scrittura su disco:", e.message);
+        console.error("❌ Errore salvataggio:", e.message);
     }
 }
 
-// --- API PER L'APP FRONTEND ---
-
-// Endpoint per ricevere nuovi alert
-app.post("/set_alert", (req, res) => {
+// === ENDPOINT UNIFICATO /set_alert (add, update e remove) ===
+app.post("/set_alert", async (req, res) => {
     const { device_id, exchange, symbol, price, token, chatId } = req.body;
 
     if (!token || !chatId) {
-        console.log("⚠️ Alert ricevuto ma mancano Token o ChatID. Controlla le impostazioni dell'App.");
-        return res.status(400).json({ error: "Dati Telegram mancanti" });
+        return res.status(400).json({ error: "Token o ChatID mancanti" });
     }
 
-    // Pulizia Token da spazi bianchi o invii
     const cleanToken = token.trim().replace(/\s/g, "");
+    const upperSymbol = symbol.toUpperCase();
 
-    // Rimuove vecchi alert identici dello stesso utente
-    alertsData.active_alerts = alertsData.active_alerts.filter(a => 
-        !(a.device_id === device_id && a.symbol === symbol)
+    // Rimuove sempre eventuali alert vecchi dello stesso device/symbol
+    alertsData.active_alerts = alertsData.active_alerts.filter(a =>
+        !(a.device_id === device_id && a.symbol === upperSymbol)
     );
 
-    // Aggiunta nuovo alert
+    // Se price è null o undefined → è una rimozione
+    if (price === null || price === undefined) {
+        saveData();
+        console.log(`🗑️ Alert rimosso: ${upperSymbol}`);
+        return res.json({ status: "removed", message: "Alert rimosso" });
+    }
+
+    // Altrimenti → aggiunta/aggiornamento
     alertsData.active_alerts.push({
         device_id: device_id || "unknown",
         exchange: exchange || "bybit",
-        symbol: symbol.toUpperCase(),
+        symbol: upperSymbol,
         price: parseFloat(price),
         token: cleanToken,
         chatId: chatId,
@@ -73,41 +73,45 @@ app.post("/set_alert", (req, res) => {
     });
 
     saveData();
-    console.log(`📌 NUOVO ALERT: ${symbol} a ${price} (Via ${exchange})`);
-    res.json({ status: "success", message: "Alert registrato sul server" });
+    console.log(`📌 Alert impostato: ${upperSymbol} a ${price}`);
+
+    // === INVIO MESSAGGIO DI CONFERMA "ALERT ATTIVATO" ===
+    const confirmText = `✅ <b>ALERT ATTIVATO</b>\n\n` +
+                        `<b>Coppia:</b> ${upperSymbol}\n` +
+                        `<b>Target price:</b> ${parseFloat(price)}\n` +
+                        `<b>Exchange:</b> ${exchange.toUpperCase()}`;
+
+    try {
+        await axios.post(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
+            chat_id: chatId,
+            text: confirmText,
+            parse_mode: "HTML"
+        });
+        console.log("✅ Messaggio di conferma inviato");
+    } catch (e) {
+        console.error("❌ Errore invio conferma Telegram:", e.response?.data || e.message);
+    }
+
+    res.json({ status: "success", message: "Alert registrato e conferma inviata" });
 });
 
-// Endpoint per rimuovere alert
+// Puoi mantenere /remove_alert per compatibilità, o rimuoverlo
 app.post("/remove_alert", (req, res) => {
     const { device_id, symbol } = req.body;
-    alertsData.active_alerts = alertsData.active_alerts.filter(a => 
-        !(a.device_id === device_id && a.symbol === symbol)
+    alertsData.active_alerts = alertsData.active_alerts.filter(a =>
+        !(a.device_id === device_id && a.symbol === symbol.toUpperCase())
     );
     saveData();
-    console.log(`🗑️ Rimosso alert per: ${symbol}`);
-    res.json({ status: "success" });
+    res.json({ status: "removed" });
 });
 
-// --- DEBUG & MONITORAGGIO (Vedi il JSON dal browser) ---
-app.get("/debug", (req, res) => {
-    res.json({
-        uptime: process.uptime(),
-        total_tracked: alertsData.active_alerts.length,
-        alerts: alertsData.active_alerts
-    });
-});
-
-app.get("/", (req, res) => res.send("🤖 Srazu Bot Server is RUNNING."));
-
-// --- LOGICA MONITORAGGIO PREZZI ---
-
+// === RESTO DEL CODICE INVARIATO ===
 async function fetchPrice(exchange, symbol) {
     try {
         if (exchange.toLowerCase() === "binance") {
             const r = await axios.get(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`);
             return parseFloat(r.data.price);
         } else {
-            // Default Bybit
             const r = await axios.get(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`);
             return parseFloat(r.data.result.list[0].lastPrice);
         }
@@ -127,23 +131,20 @@ async function checkAlerts() {
         const currentPrice = await fetchPrice(alert.exchange, alert.symbol);
         if (!currentPrice) continue;
 
-        // Se è la prima volta che leggiamo il prezzo, lo salviamo e passiamo al prossimo
         if (alert.lastPrice === null) {
             alert.lastPrice = currentPrice;
             continue;
         }
 
         let crossed = false;
-        // Prezzo sale sopra il target
         if (alert.lastPrice < alert.price && currentPrice >= alert.price) crossed = true;
-        // Prezzo scende sotto il target
         if (alert.lastPrice > alert.price && currentPrice <= alert.price) crossed = true;
 
         alert.lastPrice = currentPrice;
 
         if (crossed) {
             console.log(`🎯 TARGET RAGGIUNTO: ${alert.symbol} @ ${currentPrice}`);
-            
+
             const text = `🚨 <b>PRICE ALERT!</b>\n\n` +
                          `<b>Coppia:</b> ${alert.symbol}\n` +
                          `<b>Target:</b> ${alert.price}\n` +
@@ -158,7 +159,6 @@ async function checkAlerts() {
         }
     }
 
-    // Pulizia database: eliminiamo quelli già inviati
     if (hasChanged) {
         alertsData.active_alerts = alertsData.active_alerts.filter(a => !a.triggered);
         saveData();
@@ -167,29 +167,29 @@ async function checkAlerts() {
 
 async function sendTelegram(token, chatId, text) {
     try {
-        // Se il token non è valido, l'URL risponderà 404 (Not Found)
-        const url = `https://api.telegram.org/bot${token}/sendMessage`;
-        await axios.post(url, {
+        await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
             chat_id: chatId,
             text: text,
             parse_mode: "HTML"
         });
-        console.log("✅ Notifica Telegram inviata!");
+        console.log("✅ Alert Telegram inviato");
         return true;
     } catch (e) {
-        if (e.response && e.response.status === 404) {
-            console.error("❌ ERRORE 404: Token Telegram non esistente. Verificalo!");
+        if (e.response?.status === 404) {
+            console.error("❌ Token Telegram non valido (404)");
         } else {
-            console.error("❌ Errore invio Telegram:", e.response ? e.response.data : e.message);
+            console.error("❌ Errore Telegram:", e.response?.data || e.message);
         }
         return false;
     }
 }
 
-// --- AVVIO SERVER ---
 loadData();
-setInterval(checkAlerts, 5000); // Controlla ogni 5 secondi
+setInterval(checkAlerts, 5000);
+
+app.get("/debug", (req, res) => res.json(alertsData));
+app.get("/", (req, res) => res.send("🤖 Srazu Bot Server RUNNING"));
 
 app.listen(PORT, () => {
-    console.log(`🚀 Server pronto sulla porta ${PORT}`);
+    console.log(`🚀 Server attivo sulla porta ${PORT}`);
 });
