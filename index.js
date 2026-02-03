@@ -3,6 +3,7 @@ const axios = require("axios");
 const express = require("express");
 const cors = require("cors");
 
+// Configurazione Percorsi: Usa il volume /data se presente, altrimenti locale
 const ALERT_FILE = process.env.RENDER ? "/data/alerts.json" : "./alerts.json";
 const PORT = process.env.PORT || 3000;
 
@@ -12,6 +13,7 @@ app.use(express.json());
 
 let alertsData = { active_alerts: [] };
 
+// --- CARICAMENTO DATI ---
 function loadData() {
     try {
         if (fs.existsSync(ALERT_FILE)) {
@@ -20,7 +22,7 @@ function loadData() {
             if (!alertsData.active_alerts) alertsData.active_alerts = [];
             console.log(`📂 Database caricato. Alert attivi: ${alertsData.active_alerts.length}`);
         } else {
-            console.log("🆕 File JSON non trovato. Creazione nuovo.");
+            console.log("🆕 Nessun database trovato. Ne creo uno nuovo.");
             saveData();
         }
     } catch (e) {
@@ -29,42 +31,37 @@ function loadData() {
     }
 }
 
+// --- SALVATAGGIO DATI ---
 function saveData() {
     try {
         fs.writeFileSync(ALERT_FILE, JSON.stringify(alertsData, null, 2));
     } catch (e) {
-        console.error("❌ Errore salvataggio:", e.message);
+        console.error("❌ Errore scrittura file:", e.message);
     }
 }
 
-// === ENDPOINT UNIFICATO /set_alert (add, update e remove) ===
-app.post("/set_alert", async (req, res) => {
+// --- API PER L'APP ---
+
+app.post("/set_alert", (req, res) => {
     const { device_id, exchange, symbol, price, token, chatId } = req.body;
 
-    if (!token || !chatId) {
-        return res.status(400).json({ error: "Token o ChatID mancanti" });
+    if (!token || !chatId || !price) {
+        console.error("⚠️ Ricevuta richiesta incompleta. Token o Price mancanti.");
+        return res.status(400).json({ error: "Dati mancanti" });
     }
 
+    // Pulizia token da spazi o invii accidentali
     const cleanToken = token.trim().replace(/\s/g, "");
-    const upperSymbol = symbol.toUpperCase();
 
-    // Rimuove sempre eventuali alert vecchi dello stesso device/symbol
-    alertsData.active_alerts = alertsData.active_alerts.filter(a =>
-        !(a.device_id === device_id && a.symbol === upperSymbol)
+    // Rimuove eventuali alert duplicati per lo stesso simbolo sullo stesso dispositivo
+    alertsData.active_alerts = alertsData.active_alerts.filter(a => 
+        !(a.device_id === device_id && a.symbol === symbol)
     );
 
-    // Se price è null o undefined → è una rimozione
-    if (price === null || price === undefined) {
-        saveData();
-        console.log(`🗑️ Alert rimosso: ${upperSymbol}`);
-        return res.json({ status: "removed", message: "Alert rimosso" });
-    }
-
-    // Altrimenti → aggiunta/aggiornamento
     alertsData.active_alerts.push({
-        device_id: device_id || "unknown",
+        device_id: device_id || "web-user",
         exchange: exchange || "bybit",
-        symbol: upperSymbol,
+        symbol: symbol.toUpperCase(),
         price: parseFloat(price),
         token: cleanToken,
         chatId: chatId,
@@ -73,39 +70,24 @@ app.post("/set_alert", async (req, res) => {
     });
 
     saveData();
-    console.log(`📌 Alert impostato: ${upperSymbol} a ${price}`);
-
-    // === INVIO MESSAGGIO DI CONFERMA "ALERT ATTIVATO" ===
-    const confirmText = `✅ <b>ALERT ATTIVATO</b>\n\n` +
-                        `<b>Coppia:</b> ${upperSymbol}\n` +
-                        `<b>Target price:</b> ${parseFloat(price)}\n` +
-                        `<b>Exchange:</b> ${exchange.toUpperCase()}`;
-
-    try {
-        await axios.post(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
-            chat_id: chatId,
-            text: confirmText,
-            parse_mode: "HTML"
-        });
-        console.log("✅ Messaggio di conferma inviato");
-    } catch (e) {
-        console.error("❌ Errore invio conferma Telegram:", e.response?.data || e.message);
-    }
-
-    res.json({ status: "success", message: "Alert registrato e conferma inviata" });
+    console.log(`📌 Alert registrato: ${symbol} @ ${price}`);
+    console.log(`🔑 Token usato (prime 6 cifre): ${cleanToken.substring(0, 6)}...`);
+    res.json({ status: "success" });
 });
 
-// Puoi mantenere /remove_alert per compatibilità, o rimuoverlo
-app.post("/remove_alert", (req, res) => {
-    const { device_id, symbol } = req.body;
-    alertsData.active_alerts = alertsData.active_alerts.filter(a =>
-        !(a.device_id === device_id && a.symbol === symbol.toUpperCase())
-    );
-    saveData();
-    res.json({ status: "removed" });
+// --- DEBUG: VEDI IL CONTENUTO DAL BROWSER ---
+app.get("/debug", (req, res) => {
+    res.json({
+        server_running: true,
+        total_alerts: alertsData.active_alerts.length,
+        data: alertsData.active_alerts
+    });
 });
 
-// === RESTO DEL CODICE INVARIATO ===
+app.get("/", (req, res) => res.send("🚀 Srazu Crypto Bot is Online"));
+
+// --- LOGICA DI MONITORAGGIO ---
+
 async function fetchPrice(exchange, symbol) {
     try {
         if (exchange.toLowerCase() === "binance") {
@@ -120,10 +102,10 @@ async function fetchPrice(exchange, symbol) {
     }
 }
 
-async function checkAlerts() {
+async function checkLoop() {
     if (alertsData.active_alerts.length === 0) return;
 
-    let hasChanged = false;
+    let changed = false;
 
     for (let alert of alertsData.active_alerts) {
         if (alert.triggered) continue;
@@ -136,30 +118,33 @@ async function checkAlerts() {
             continue;
         }
 
-        let crossed = false;
-        if (alert.lastPrice < alert.price && currentPrice >= alert.price) crossed = true;
-        if (alert.lastPrice > alert.price && currentPrice <= alert.price) crossed = true;
+        let isHit = false;
+        // Check incrocio (prezzo sale sopra o scende sotto il target)
+        if ((alert.lastPrice < alert.price && currentPrice >= alert.price) ||
+            (alert.lastPrice > alert.price && currentPrice <= alert.price)) {
+            isHit = true;
+        }
 
         alert.lastPrice = currentPrice;
 
-        if (crossed) {
+        if (isHit) {
             console.log(`🎯 TARGET RAGGIUNTO: ${alert.symbol} @ ${currentPrice}`);
+            
+            const msg = `🚨 <b>PRICE ALERT!</b>\n\n` +
+                        `<b>Coppia:</b> ${alert.symbol}\n` +
+                        `<b>Target:</b> ${alert.price}\n` +
+                        `<b>Prezzo Attuale:</b> ${currentPrice}\n` +
+                        `<b>Exchange:</b> ${alert.exchange.toUpperCase()}`;
 
-            const text = `🚨 <b>PRICE ALERT!</b>\n\n` +
-                         `<b>Coppia:</b> ${alert.symbol}\n` +
-                         `<b>Target:</b> ${alert.price}\n` +
-                         `<b>Prezzo Attuale:</b> ${currentPrice}\n` +
-                         `<b>Exchange:</b> ${alert.exchange.toUpperCase()}`;
-
-            const success = await sendTelegram(alert.token, alert.chatId, text);
+            const success = await sendTelegram(alert.token, alert.chatId, msg);
             if (success) {
                 alert.triggered = true;
-                hasChanged = true;
+                changed = true;
             }
         }
     }
 
-    if (hasChanged) {
+    if (changed) {
         alertsData.active_alerts = alertsData.active_alerts.filter(a => !a.triggered);
         saveData();
     }
@@ -167,29 +152,28 @@ async function checkAlerts() {
 
 async function sendTelegram(token, chatId, text) {
     try {
-        await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+        const url = `https://api.telegram.org/bot${token}/sendMessage`;
+        await axios.post(url, {
             chat_id: chatId,
             text: text,
             parse_mode: "HTML"
         });
-        console.log("✅ Alert Telegram inviato");
+        console.log("✅ Telegram inviato con successo!");
         return true;
     } catch (e) {
-        if (e.response?.status === 404) {
-            console.error("❌ Token Telegram non valido (404)");
-        } else {
-            console.error("❌ Errore Telegram:", e.response?.data || e.message);
+        const status = e.response ? e.response.status : "No Response";
+        console.error(`❌ Errore Telegram (${status}): ${e.message}`);
+        if (status === 404) {
+            console.error("⚠️ Il Token è invalido o l'URL è malformato.");
         }
         return false;
     }
 }
 
+// --- START ---
 loadData();
-setInterval(checkAlerts, 5000);
-
-app.get("/debug", (req, res) => res.json(alertsData));
-app.get("/", (req, res) => res.send("🤖 Srazu Bot Server RUNNING"));
+setInterval(checkLoop, 5000); // Controllo ogni 5 secondi
 
 app.listen(PORT, () => {
-    console.log(`🚀 Server attivo sulla porta ${PORT}`);
+    console.log(`🌍 Server in ascolto sulla porta ${PORT}`);
 });
