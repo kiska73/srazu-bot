@@ -4,26 +4,29 @@ const axios = require("axios");
 const express = require("express");
 const cors = require("cors");
 
+// Configurazione Porte e Percorsi
+const PORT = process.env.PORT || 10000;
 const ALERT_FILE = process.env.RENDER ? "/data/alerts.json" : "./alerts.json";
-const PORT = process.env.PORT || 10000;  // Trucco per forzare redeploy su Render
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// === DICHIARAZIONE alertsData PRIMA DELLE ROUTE ===
+// === GESTIONE FILE STATICI ===
+// Questo comando dice al server di cercare index.html nella cartella principale
+app.use(express.static(__dirname));
+
 let alertsData = { active_alerts: [] };
 
-// Carica i dati all'avvio (prima delle route)
+// --- CARICAMENTO DATI ---
 function loadData() {
     try {
         if (fs.existsSync(ALERT_FILE)) {
             const raw = fs.readFileSync(ALERT_FILE, "utf8");
             alertsData = JSON.parse(raw);
-            if (!alertsData.active_alerts) alertsData.active_alerts = [];
             console.log(`📂 Database caricato. Alert attivi: ${alertsData.active_alerts.length}`);
         } else {
-            console.log("🆕 File JSON non trovato. Creazione nuovo.");
+            console.log("🆕 Database non trovato, inizializzo...");
             saveData();
         }
     } catch (e) {
@@ -36,91 +39,91 @@ function saveData() {
     try {
         fs.writeFileSync(ALERT_FILE, JSON.stringify(alertsData, null, 2));
     } catch (e) {
-        console.error("❌ Errore salvataggio:", e.message);
+        console.error("❌ Errore scrittura file:", e.message);
     }
 }
 
-loadData();  // Carica subito i dati esistenti
+// --- API ROUTES ---
 
-// === SERVING FILE STATICI (frontend) ===
-app.use(express.static(path.join(__dirname, 'public')));
-
-// === API ROUTES ===
+// Impostazione Alert
 app.post("/set_alert", async (req, res) => {
     const { device_id, exchange, symbol, price, token, chatId } = req.body;
 
     if (!token || !chatId) {
-        return res.status(400).json({ error: "Token o ChatID mancanti" });
+        return res.status(400).json({ error: "Dati mancanti (Token o ChatID)" });
     }
 
-    const cleanToken = token.trim().replace(/\s/g, "");
+    const cleanToken = token.trim();
     const upperSymbol = symbol.toUpperCase();
 
-    // Rimuove alert vecchi dello stesso device/symbol
-    alertsData.active_alerts = alertsData.active_alerts.filter(a =>
+    // Rimuove vecchi alert per evitare doppioni
+    alertsData.active_alerts = alertsData.active_alerts.filter(a => 
         !(a.device_id === device_id && a.symbol === upperSymbol)
     );
 
-    if (price === null || price === undefined) {
-        saveData();
-        console.log(`🗑️ Alert rimosso: ${upperSymbol}`);
-        return res.json({ status: "removed" });
-    }
+    if (price !== null && price !== undefined) {
+        alertsData.active_alerts.push({
+            device_id: device_id || "web",
+            exchange: exchange || "bybit",
+            symbol: upperSymbol,
+            price: parseFloat(price),
+            token: cleanToken,
+            chatId: chatId,
+            triggered: false,
+            lastPrice: null
+        });
 
-    alertsData.active_alerts.push({
-        device_id: device_id || "unknown",
-        exchange: exchange || "bybit",
-        symbol: upperSymbol,
-        price: parseFloat(price),
-        token: cleanToken,
-        chatId: chatId,
-        triggered: false,
-        lastPrice: null
-    });
+        // Invio conferma immediata su Telegram
+        const confirmText = `✅ <b>ALERT ATTIVATO</b>\n\n` +
+                            `🪙 <b>Coppia:</b> ${upperSymbol}\n` +
+                            `🎯 <b>Target:</b> ${price}\n` +
+                            `🏛️ <b>Exchange:</b> ${exchange.toUpperCase()}`;
+        
+        try {
+            await axios.post(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
+                chat_id: chatId,
+                text: confirmText,
+                parse_mode: "HTML"
+            });
+        } catch (err) {
+            console.error("Errore Telegram conferma:", err.message);
+        }
+    }
 
     saveData();
-    console.log(`📌 Alert impostato: ${upperSymbol} a ${price}`);
-
-    // Messaggio di conferma "ALERT ATTIVATO"
-    const confirmText = `✅ <b>ALERT ATTIVATO</b>\n\n` +
-                        `<b>Coppia:</b> ${upperSymbol}\n` +
-                        `<b>Target price:</b> ${parseFloat(price)}\n` +
-                        `<b>Exchange:</b> ${exchange.toUpperCase()}`;
-
-    try {
-        await axios.post(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
-            chat_id: chatId,
-            text: confirmText,
-            parse_mode: "HTML"
-        });
-        console.log("✅ Conferma Telegram inviata");
-    } catch (e) {
-        console.error("❌ Errore conferma Telegram:", e.response?.data || e.message);
-    }
-
-    res.json({ status: "success", message: "Alert registrato" });
+    res.json({ status: "ok" });
 });
 
-app.get("/debug", (req, res) => res.json(alertsData));
+// Debug
+app.get("/debug", (req, res) => {
+    res.json({
+        status: "online",
+        alerts: alertsData.active_alerts
+    });
+});
 
-// Root route serve index.html
-app.get("/", (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+// Serve l'App (index.html)
+app.get("/", (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
+});
 
-// Catch-all per SPA (refresh pagine senza 404)
+// Catch-all per evitare il "Not Found" al refresh
 app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+    res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// === FUNZIONI HELPER ===
+// --- LOGICA DI CONTROLLO PREZZI ---
+
 async function fetchPrice(exchange, symbol) {
     try {
-        if (exchange.toLowerCase() === "binance") {
-            const r = await axios.get(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`);
-            return parseFloat(r.data.price);
-        } else {
-            const r = await axios.get(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`);
-            return parseFloat(r.data.result.list[0].lastPrice);
-        }
+        const url = exchange.toLowerCase() === "binance" 
+            ? `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`
+            : `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`;
+        
+        const r = await axios.get(url);
+        return exchange.toLowerCase() === "binance" 
+            ? parseFloat(r.data.price) 
+            : parseFloat(r.data.result.list[0].lastPrice);
     } catch (e) {
         return null;
     }
@@ -129,11 +132,8 @@ async function fetchPrice(exchange, symbol) {
 async function checkAlerts() {
     if (alertsData.active_alerts.length === 0) return;
 
-    let hasChanged = false;
-
+    let changed = false;
     for (let alert of alertsData.active_alerts) {
-        if (alert.triggered) continue;
-
         const currentPrice = await fetchPrice(alert.exchange, alert.symbol);
         if (!currentPrice) continue;
 
@@ -142,30 +142,25 @@ async function checkAlerts() {
             continue;
         }
 
-        let crossed = false;
-        if (alert.lastPrice < alert.price && currentPrice >= alert.price) crossed = true;
-        if (alert.lastPrice > alert.price && currentPrice <= alert.price) crossed = true;
+        const crossedUp = alert.lastPrice < alert.price && currentPrice >= alert.price;
+        const crossedDown = alert.lastPrice > alert.price && currentPrice <= alert.price;
 
-        alert.lastPrice = currentPrice;
-
-        if (crossed) {
-            console.log(`🎯 TARGET RAGGIUNTO: ${alert.symbol} @ ${currentPrice}`);
-
+        if (crossedUp || crossedDown) {
             const text = `🚨 <b>PRICE ALERT!</b>\n\n` +
-                         `<b>Coppia:</b> ${alert.symbol}\n` +
-                         `<b>Target:</b> ${alert.price}\n` +
-                         `<b>Prezzo Attuale:</b> ${currentPrice}\n` +
-                         `<b>Exchange:</b> ${alert.exchange.toUpperCase()}`;
+                         `💎 <b>${alert.symbol}</b>\n` +
+                         `🎯 Target: ${alert.price}\n` +
+                         `💰 Prezzo attuale: ${currentPrice}`;
 
-            const success = await sendTelegram(alert.token, alert.chatId, text);
-            if (success) {
+            const sent = await sendTelegram(alert.token, alert.chatId, text);
+            if (sent) {
                 alert.triggered = true;
-                hasChanged = true;
+                changed = true;
             }
         }
+        alert.lastPrice = currentPrice;
     }
 
-    if (hasChanged) {
+    if (changed) {
         alertsData.active_alerts = alertsData.active_alerts.filter(a => !a.triggered);
         saveData();
     }
@@ -178,15 +173,14 @@ async function sendTelegram(token, chatId, text) {
             text: text,
             parse_mode: "HTML"
         });
-        console.log("✅ Alert Telegram inviato");
         return true;
     } catch (e) {
-        console.error("❌ Errore Telegram:", e.response?.data || e.message);
         return false;
     }
 }
 
-// === AVVIO ===
+// Avvio
+loadData();
 setInterval(checkAlerts, 5000);
 
 app.listen(PORT, () => {
