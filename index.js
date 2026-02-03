@@ -3,8 +3,9 @@ const axios = require("axios");
 const express = require("express");
 const cors = require("cors");
 
-// Configurazione Percorsi: Usa il volume /data se presente, altrimenti locale
-const ALERT_FILE = process.env.RENDER ? "/data/alerts.json" : "./alerts.json";
+// Configurazione percorsi: Usa /data solo se sei su Render e hai il disco
+const ALERT_DIR = process.env.RENDER ? "/data" : ".";
+const ALERT_FILE = `${ALERT_DIR}/alerts.json`;
 const PORT = process.env.PORT || 3000;
 
 const app = express();
@@ -16,13 +17,17 @@ let alertsData = { active_alerts: [] };
 // --- CARICAMENTO DATI ---
 function loadData() {
     try {
+        // Se la cartella /data non esiste (manca il Disk), la creiamo o usiamo quella locale
+        if (process.env.RENDER && !fs.existsSync(ALERT_DIR)) {
+            console.log("⚠️ Attenzione: Cartella /data non trovata. Usando memoria locale.");
+        }
+
         if (fs.existsSync(ALERT_FILE)) {
             const raw = fs.readFileSync(ALERT_FILE, "utf8");
             alertsData = JSON.parse(raw);
-            if (!alertsData.active_alerts) alertsData.active_alerts = [];
             console.log(`📂 Database caricato. Alert attivi: ${alertsData.active_alerts.length}`);
         } else {
-            console.log("🆕 Nessun database trovato. Ne creo uno nuovo.");
+            console.log("🆕 Nessun database trovato. Inizializzo file vuoto.");
             saveData();
         }
     } catch (e) {
@@ -40,26 +45,39 @@ function saveData() {
     }
 }
 
-// --- API PER L'APP ---
+// --- ROTTE DEL SERVER ---
 
+// Pagina principale (Home)
+app.get("/", (req, res) => {
+    res.send("<h1>🚀 Srazu Crypto Bot è Online</h1><p>Status: <b>Funzionante</b></p><p>Vai su <a href='/debug'>/debug</a> per i dati.</p>");
+});
+
+// Pagina Debug
+app.get("/debug", (req, res) => {
+    res.json({
+        server_time: new Date().toISOString(),
+        total_tracked: alertsData.active_alerts.length,
+        alerts: alertsData.active_alerts
+    });
+});
+
+// Ricezione Alert dall'App
 app.post("/set_alert", (req, res) => {
     const { device_id, exchange, symbol, price, token, chatId } = req.body;
 
     if (!token || !chatId || !price) {
-        console.error("⚠️ Ricevuta richiesta incompleta. Token o Price mancanti.");
-        return res.status(400).json({ error: "Dati mancanti" });
+        return res.status(400).json({ error: "Mancano Token, ChatID o Prezzo" });
     }
 
-    // Pulizia token da spazi o invii accidentali
-    const cleanToken = token.trim().replace(/\s/g, "");
+    const cleanToken = token.trim();
 
-    // Rimuove eventuali alert duplicati per lo stesso simbolo sullo stesso dispositivo
+    // Rimuove vecchi alert per lo stesso simbolo
     alertsData.active_alerts = alertsData.active_alerts.filter(a => 
-        !(a.device_id === device_id && a.symbol === symbol)
+        !(a.device_id === device_id && a.symbol === symbol.toUpperCase())
     );
 
     alertsData.active_alerts.push({
-        device_id: device_id || "web-user",
+        device_id: device_id || "default",
         exchange: exchange || "bybit",
         symbol: symbol.toUpperCase(),
         price: parseFloat(price),
@@ -70,31 +88,23 @@ app.post("/set_alert", (req, res) => {
     });
 
     saveData();
-    console.log(`📌 Alert registrato: ${symbol} @ ${price}`);
-    console.log(`🔑 Token usato (prime 6 cifre): ${cleanToken.substring(0, 6)}...`);
-    res.json({ status: "success" });
+    console.log(`📌 Registrato alert per ${symbol} a ${price}`);
+    res.json({ status: "ok", message: "Alert salvato correttamente" });
 });
 
-// --- DEBUG: VEDI IL CONTENUTO DAL BROWSER ---
-app.get("/debug", (req, res) => {
-    res.json({
-        server_running: true,
-        total_alerts: alertsData.active_alerts.length,
-        data: alertsData.active_alerts
-    });
-});
-
-app.get("/", (req, res) => res.send("🚀 Srazu Crypto Bot is Online"));
-
-// --- LOGICA DI MONITORAGGIO ---
+// --- LOGICA MONITORAGGIO PREZZI ---
 
 async function fetchPrice(exchange, symbol) {
     try {
+        const url = exchange.toLowerCase() === "binance" 
+            ? `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`
+            : `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`;
+        
+        const r = await axios.get(url);
+        
         if (exchange.toLowerCase() === "binance") {
-            const r = await axios.get(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`);
             return parseFloat(r.data.price);
         } else {
-            const r = await axios.get(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`);
             return parseFloat(r.data.result.list[0].lastPrice);
         }
     } catch (e) {
@@ -102,10 +112,10 @@ async function fetchPrice(exchange, symbol) {
     }
 }
 
-async function checkLoop() {
+async function checkAlerts() {
     if (alertsData.active_alerts.length === 0) return;
 
-    let changed = false;
+    let hasChanges = false;
 
     for (let alert of alertsData.active_alerts) {
         if (alert.triggered) continue;
@@ -118,33 +128,29 @@ async function checkLoop() {
             continue;
         }
 
-        let isHit = false;
-        // Check incrocio (prezzo sale sopra o scende sotto il target)
-        if ((alert.lastPrice < alert.price && currentPrice >= alert.price) ||
-            (alert.lastPrice > alert.price && currentPrice <= alert.price)) {
-            isHit = true;
-        }
+        // Logica di incrocio prezzo
+        const crossedUp = alert.lastPrice < alert.price && currentPrice >= alert.price;
+        const crossedDown = alert.lastPrice > alert.price && currentPrice <= alert.price;
 
-        alert.lastPrice = currentPrice;
-
-        if (isHit) {
-            console.log(`🎯 TARGET RAGGIUNTO: ${alert.symbol} @ ${currentPrice}`);
+        if (crossedUp || crossedDown) {
+            console.log(`🎯 Trigger! ${alert.symbol} ha toccato ${currentPrice}`);
             
-            const msg = `🚨 <b>PRICE ALERT!</b>\n\n` +
-                        `<b>Coppia:</b> ${alert.symbol}\n` +
-                        `<b>Target:</b> ${alert.price}\n` +
-                        `<b>Prezzo Attuale:</b> ${currentPrice}\n` +
-                        `<b>Exchange:</b> ${alert.exchange.toUpperCase()}`;
+            const text = `🚨 <b>ALERT PREZZO!</b>\n\n` +
+                         `💎 <b>${alert.symbol}</b>\n` +
+                         `🎯 Target: ${alert.price}\n` +
+                         `💰 Prezzo attuale: ${currentPrice}\n` +
+                         `🏛️ Exchange: ${alert.exchange.toUpperCase()}`;
 
-            const success = await sendTelegram(alert.token, alert.chatId, msg);
-            if (success) {
+            const sent = await sendTelegram(alert.token, alert.chatId, text);
+            if (sent) {
                 alert.triggered = true;
-                changed = true;
+                hasChanges = true;
             }
         }
+        alert.lastPrice = currentPrice;
     }
 
-    if (changed) {
+    if (hasChanges) {
         alertsData.active_alerts = alertsData.active_alerts.filter(a => !a.triggered);
         saveData();
     }
@@ -158,22 +164,17 @@ async function sendTelegram(token, chatId, text) {
             text: text,
             parse_mode: "HTML"
         });
-        console.log("✅ Telegram inviato con successo!");
         return true;
     } catch (e) {
-        const status = e.response ? e.response.status : "No Response";
-        console.error(`❌ Errore Telegram (${status}): ${e.message}`);
-        if (status === 404) {
-            console.error("⚠️ Il Token è invalido o l'URL è malformato.");
-        }
+        console.error("❌ Errore Telegram:", e.response ? e.response.status : e.message);
         return false;
     }
 }
 
-// --- START ---
+// --- AVVIO ---
 loadData();
-setInterval(checkLoop, 5000); // Controllo ogni 5 secondi
+setInterval(checkAlerts, 5000); // Controlla ogni 5 secondi
 
 app.listen(PORT, () => {
-    console.log(`🌍 Server in ascolto sulla porta ${PORT}`);
+    console.log(`🚀 Server in ascolto sulla porta ${PORT}`);
 });
