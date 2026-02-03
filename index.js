@@ -1,5 +1,5 @@
 const fs = require("fs");
-const path = require("path");  // Aggiunto per serving file
+const path = require("path");
 const axios = require("axios");
 const express = require("express");
 const cors = require("cors");
@@ -10,6 +10,37 @@ const PORT = process.env.PORT || 10000;  // Trucco per forzare redeploy su Rende
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// === DICHIARAZIONE alertsData PRIMA DELLE ROUTE ===
+let alertsData = { active_alerts: [] };
+
+// Carica i dati all'avvio (prima delle route)
+function loadData() {
+    try {
+        if (fs.existsSync(ALERT_FILE)) {
+            const raw = fs.readFileSync(ALERT_FILE, "utf8");
+            alertsData = JSON.parse(raw);
+            if (!alertsData.active_alerts) alertsData.active_alerts = [];
+            console.log(`📂 Database caricato. Alert attivi: ${alertsData.active_alerts.length}`);
+        } else {
+            console.log("🆕 File JSON non trovato. Creazione nuovo.");
+            saveData();
+        }
+    } catch (e) {
+        console.error("❌ Errore caricamento:", e.message);
+        alertsData = { active_alerts: [] };
+    }
+}
+
+function saveData() {
+    try {
+        fs.writeFileSync(ALERT_FILE, JSON.stringify(alertsData, null, 2));
+    } catch (e) {
+        console.error("❌ Errore salvataggio:", e.message);
+    }
+}
+
+loadData();  // Carica subito i dati esistenti
 
 // === SERVING FILE STATICI (frontend) ===
 app.use(express.static(path.join(__dirname, 'public')));
@@ -70,43 +101,17 @@ app.post("/set_alert", async (req, res) => {
     res.json({ status: "success", message: "Alert registrato" });
 });
 
-// Altre API (debug, root)
 app.get("/debug", (req, res) => res.json(alertsData));
+
+// Root route serve index.html
 app.get("/", (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-// === CATCH-ALL per SPA (importante per refresh pagine) ===
+// Catch-all per SPA (refresh pagine senza 404)
 app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// === RESTO CODICE (loadData, saveData, fetchPrice, checkAlerts, sendTelegram) ===
-let alertsData = { active_alerts: [] };
-
-function loadData() {
-    try {
-        if (fs.existsSync(ALERT_FILE)) {
-            const raw = fs.readFileSync(ALERT_FILE, "utf8");
-            alertsData = JSON.parse(raw);
-            if (!alertsData.active_alerts) alertsData.active_alerts = [];
-            console.log(`📂 Database caricato. Alert attivi: ${alertsData.active_alerts.length}`);
-        } else {
-            console.log("🆕 File JSON non trovato. Creazione nuovo.");
-            saveData();
-        }
-    } catch (e) {
-        console.error("❌ Errore caricamento:", e.message);
-        alertsData = { active_alerts: [] };
-    }
-}
-
-function saveData() {
-    try {
-        fs.writeFileSync(ALERT_FILE, JSON.stringify(alertsData, null, 2));
-    } catch (e) {
-        console.error("❌ Errore salvataggio:", e.message);
-    }
-}
-
+// === FUNZIONI HELPER ===
 async function fetchPrice(exchange, symbol) {
     try {
         if (exchange.toLowerCase() === "binance") {
@@ -181,7 +186,7 @@ async function sendTelegram(token, chatId, text) {
     }
 }
 
-loadData();
+// === AVVIO ===
 setInterval(checkAlerts, 5000);
 
 app.listen(PORT, () => {
