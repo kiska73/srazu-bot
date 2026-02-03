@@ -1,83 +1,45 @@
 const fs = require("fs");
-const path = require("path");
+const path = require("path");  // Aggiunto per serving file
 const axios = require("axios");
 const express = require("express");
 const cors = require("cors");
+
+const ALERT_FILE = process.env.RENDER ? "/data/alerts.json" : "./alerts.json";
+const PORT = process.env.PORT || 10000;  // Trucco per forzare redeploy su Render
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- CONFIGURAZIONE PORTE E PERCORSI ---
-// Render assegna automaticamente una porta, noi usiamo quella o la 10000 di default
-const PORT = process.env.PORT || 10000; 
+// === SERVING FILE STATICI (frontend) ===
+app.use(express.static(path.join(__dirname, 'public')));
 
-// Percorso per il database JSON (usa il Volume /data se presente su Render)
-const ALERT_DIR = process.env.RENDER ? "/data" : ".";
-const ALERT_FILE = path.join(ALERT_DIR, "alerts.json");
-
-// 1. SERVI I FILE STATICI: Questo carica la tua App (index.html, app.js) dalla cartella /public
-app.use(express.static(path.join(__dirname, "public")));
-
-let alertsData = { active_alerts: [] };
-
-// --- CARICAMENTO DATI ---
-function loadData() {
-    try {
-        if (fs.existsSync(ALERT_FILE)) {
-            const raw = fs.readFileSync(ALERT_FILE, "utf8");
-            alertsData = JSON.parse(raw);
-            console.log(`📂 Database caricato. Alert attivi: ${alertsData.active_alerts.length}`);
-        } else {
-            console.log("🆕 Nessun database trovato. Ne creo uno nuovo.");
-            saveData();
-        }
-    } catch (e) {
-        console.error("❌ Errore caricamento JSON:", e.message);
-        alertsData = { active_alerts: [] };
-    }
-}
-
-// --- SALVATAGGIO DATI ---
-function saveData() {
-    try {
-        fs.writeFileSync(ALERT_FILE, JSON.stringify(alertsData, null, 2));
-    } catch (e) {
-        console.error("❌ Errore scrittura file:", e.message);
-    }
-}
-
-// --- ROTTE API ---
-
-// Debug per vedere cosa sta succedendo nel server
-app.get("/debug", (req, res) => {
-    res.json({
-        status: "online",
-        server_time: new Date().toISOString(),
-        total_tracked: alertsData.active_alerts.length,
-        alerts: alertsData.active_alerts
-    });
-});
-
-// Ricezione alert dall'App
-app.post("/set_alert", (req, res) => {
+// === API ROUTES ===
+app.post("/set_alert", async (req, res) => {
     const { device_id, exchange, symbol, price, token, chatId } = req.body;
 
-    if (!token || !chatId || !price) {
-        return res.status(400).json({ error: "Dati mancanti (Token, ChatID o Prezzo)" });
+    if (!token || !chatId) {
+        return res.status(400).json({ error: "Token o ChatID mancanti" });
     }
 
-    const cleanToken = token.trim();
+    const cleanToken = token.trim().replace(/\s/g, "");
+    const upperSymbol = symbol.toUpperCase();
 
-    // Rimuove vecchi alert per lo stesso simbolo per evitare doppioni
-    alertsData.active_alerts = alertsData.active_alerts.filter(a => 
-        !(a.device_id === device_id && a.symbol === symbol.toUpperCase())
+    // Rimuove alert vecchi dello stesso device/symbol
+    alertsData.active_alerts = alertsData.active_alerts.filter(a =>
+        !(a.device_id === device_id && a.symbol === upperSymbol)
     );
 
+    if (price === null || price === undefined) {
+        saveData();
+        console.log(`🗑️ Alert rimosso: ${upperSymbol}`);
+        return res.json({ status: "removed" });
+    }
+
     alertsData.active_alerts.push({
-        device_id: device_id || "web-user",
+        device_id: device_id || "unknown",
         exchange: exchange || "bybit",
-        symbol: symbol.toUpperCase(),
+        symbol: upperSymbol,
         price: parseFloat(price),
         token: cleanToken,
         chatId: chatId,
@@ -86,22 +48,74 @@ app.post("/set_alert", (req, res) => {
     });
 
     saveData();
-    console.log(`📌 Alert registrato: ${symbol} @ ${price}`);
-    res.json({ status: "success", message: "Alert impostato correttamente" });
+    console.log(`📌 Alert impostato: ${upperSymbol} a ${price}`);
+
+    // Messaggio di conferma "ALERT ATTIVATO"
+    const confirmText = `✅ <b>ALERT ATTIVATO</b>\n\n` +
+                        `<b>Coppia:</b> ${upperSymbol}\n` +
+                        `<b>Target price:</b> ${parseFloat(price)}\n` +
+                        `<b>Exchange:</b> ${exchange.toUpperCase()}`;
+
+    try {
+        await axios.post(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
+            chat_id: chatId,
+            text: confirmText,
+            parse_mode: "HTML"
+        });
+        console.log("✅ Conferma Telegram inviata");
+    } catch (e) {
+        console.error("❌ Errore conferma Telegram:", e.response?.data || e.message);
+    }
+
+    res.json({ status: "success", message: "Alert registrato" });
 });
 
-// --- LOGICA MONITORAGGIO ---
+// Altre API (debug, root)
+app.get("/debug", (req, res) => res.json(alertsData));
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+// === CATCH-ALL per SPA (importante per refresh pagine) ===
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// === RESTO CODICE (loadData, saveData, fetchPrice, checkAlerts, sendTelegram) ===
+let alertsData = { active_alerts: [] };
+
+function loadData() {
+    try {
+        if (fs.existsSync(ALERT_FILE)) {
+            const raw = fs.readFileSync(ALERT_FILE, "utf8");
+            alertsData = JSON.parse(raw);
+            if (!alertsData.active_alerts) alertsData.active_alerts = [];
+            console.log(`📂 Database caricato. Alert attivi: ${alertsData.active_alerts.length}`);
+        } else {
+            console.log("🆕 File JSON non trovato. Creazione nuovo.");
+            saveData();
+        }
+    } catch (e) {
+        console.error("❌ Errore caricamento:", e.message);
+        alertsData = { active_alerts: [] };
+    }
+}
+
+function saveData() {
+    try {
+        fs.writeFileSync(ALERT_FILE, JSON.stringify(alertsData, null, 2));
+    } catch (e) {
+        console.error("❌ Errore salvataggio:", e.message);
+    }
+}
 
 async function fetchPrice(exchange, symbol) {
     try {
-        const url = exchange.toLowerCase() === "binance" 
-            ? `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`
-            : `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`;
-        
-        const r = await axios.get(url);
-        return exchange.toLowerCase() === "binance" 
-            ? parseFloat(r.data.price) 
-            : parseFloat(r.data.result.list[0].lastPrice);
+        if (exchange.toLowerCase() === "binance") {
+            const r = await axios.get(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`);
+            return parseFloat(r.data.price);
+        } else {
+            const r = await axios.get(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${symbol}`);
+            return parseFloat(r.data.result.list[0].lastPrice);
+        }
     } catch (e) {
         return null;
     }
@@ -110,9 +124,11 @@ async function fetchPrice(exchange, symbol) {
 async function checkAlerts() {
     if (alertsData.active_alerts.length === 0) return;
 
-    let hasChanges = false;
+    let hasChanged = false;
 
     for (let alert of alertsData.active_alerts) {
+        if (alert.triggered) continue;
+
         const currentPrice = await fetchPrice(alert.exchange, alert.symbol);
         if (!currentPrice) continue;
 
@@ -121,28 +137,30 @@ async function checkAlerts() {
             continue;
         }
 
-        const crossedUp = alert.lastPrice < alert.price && currentPrice >= alert.price;
-        const crossedDown = alert.lastPrice > alert.price && currentPrice <= alert.price;
+        let crossed = false;
+        if (alert.lastPrice < alert.price && currentPrice >= alert.price) crossed = true;
+        if (alert.lastPrice > alert.price && currentPrice <= alert.price) crossed = true;
 
-        if (crossedUp || crossedDown) {
-            console.log(`🎯 TARGET! ${alert.symbol} a ${currentPrice}`);
-            
-            const text = `🔔 <b>TARGET RAGGIUNTO!</b>\n\n` +
-                         `📈 <b>${alert.symbol}</b>\n` +
-                         `🎯 Prezzo Target: ${alert.price}\n` +
-                         `💰 Prezzo Attuale: ${currentPrice}\n` +
-                         `🏛️ Exchange: ${alert.exchange.toUpperCase()}`;
+        alert.lastPrice = currentPrice;
+
+        if (crossed) {
+            console.log(`🎯 TARGET RAGGIUNTO: ${alert.symbol} @ ${currentPrice}`);
+
+            const text = `🚨 <b>PRICE ALERT!</b>\n\n` +
+                         `<b>Coppia:</b> ${alert.symbol}\n` +
+                         `<b>Target:</b> ${alert.price}\n` +
+                         `<b>Prezzo Attuale:</b> ${currentPrice}\n` +
+                         `<b>Exchange:</b> ${alert.exchange.toUpperCase()}`;
 
             const success = await sendTelegram(alert.token, alert.chatId, text);
             if (success) {
                 alert.triggered = true;
-                hasChanges = true;
+                hasChanged = true;
             }
         }
-        alert.lastPrice = currentPrice;
     }
 
-    if (hasChanges) {
+    if (hasChanged) {
         alertsData.active_alerts = alertsData.active_alerts.filter(a => !a.triggered);
         saveData();
     }
@@ -155,24 +173,17 @@ async function sendTelegram(token, chatId, text) {
             text: text,
             parse_mode: "HTML"
         });
+        console.log("✅ Alert Telegram inviato");
         return true;
     } catch (e) {
-        console.error("❌ Errore Telegram:", e.response ? e.response.status : e.message);
+        console.error("❌ Errore Telegram:", e.response?.data || e.message);
         return false;
     }
 }
 
-// 2. CATCH-ALL: Gestisce il refresh delle pagine e i link diretti
-app.get("*", (req, res) => {
-    if (!req.path.startsWith("/debug") && !req.path.startsWith("/set_alert")) {
-        res.sendFile(path.join(__dirname, "public", "index.html"));
-    }
-});
-
-// --- AVVIO ---
 loadData();
-setInterval(checkAlerts, 5000); // Ogni 5 secondi
+setInterval(checkAlerts, 5000);
 
 app.listen(PORT, () => {
-    console.log(`🚀 Server in ascolto sulla porta ${PORT}`);
+    console.log(`🚀 Server attivo su porta ${PORT}`);
 });
