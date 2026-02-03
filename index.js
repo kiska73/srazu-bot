@@ -11,118 +11,156 @@ app.use(express.json());
 const PORT = process.env.PORT || 10000;
 const ALERT_FILE = process.env.RENDER ? "/data/alerts.json" : path.join(__dirname, "alerts.json");
 
-// Middleware per file statici
-app.use(express.static(__dirname));
-
 let alertsData = { active_alerts: [] };
 
-// Inizializzazione Dati
+// Carica dati all'avvio
 function loadData() {
     try {
         if (fs.existsSync(ALERT_FILE)) {
             alertsData = JSON.parse(fs.readFileSync(ALERT_FILE, "utf8"));
+            if (!alertsData.active_alerts) alertsData.active_alerts = [];
             console.log(`📂 Database caricato: ${alertsData.active_alerts.length} alert.`);
         } else {
+            console.log("🆕 File alerts.json non trovato. Creazione nuovo.");
             saveData();
         }
     } catch (e) {
-        console.error("❌ Errore caricamento database:", e.message);
+        console.error("❌ Errore caricamento:", e.message);
+        alertsData = { active_alerts: [] };
     }
 }
 
 function saveData() {
     try {
-        if (process.env.RENDER && !fs.existsSync("/data")) {
-            // Se non c'è il disco esterno, salva locale per non crashare
-            fs.writeFileSync(path.join(__dirname, "alerts.json"), JSON.stringify(alertsData, null, 2));
-        } else {
-            fs.writeFileSync(ALERT_FILE, JSON.stringify(alertsData, null, 2));
-        }
+        fs.writeFileSync(ALERT_FILE, JSON.stringify(alertsData, null, 2));
     } catch (e) {
         console.error("❌ Errore salvataggio:", e.message);
     }
 }
 
-// --- ROTTE API ---
+loadData();
+
+// === API ROUTES (definite PRIMA del serving statico) ===
 app.post("/set_alert", async (req, res) => {
     const { device_id, exchange, symbol, price, token, chatId } = req.body;
-    if (!token || !chatId) return res.status(400).json({ error: "Configurazione mancante" });
 
-    const upperSymbol = symbol.toUpperCase();
-    alertsData.active_alerts = alertsData.active_alerts.filter(a => !(a.device_id === device_id && a.symbol === upperSymbol));
-
-    if (price) {
-        alertsData.active_alerts.push({
-            device_id, exchange, symbol: upperSymbol, price: parseFloat(price),
-            token, chatId, triggered: false, lastPrice: null
-        });
-        
-        // Conferma Telegram
-        try {
-            await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
-                chat_id: chatId,
-                text: `✅ <b>Alert Attivo</b>\n💰 ${upperSymbol} @ ${price}`,
-                parse_mode: "HTML"
-            });
-        } catch (e) { console.log("Telegram error"); }
+    if (!token || !chatId) {
+        return res.status(400).json({ error: "Configurazione Telegram mancante" });
     }
+
+    const cleanToken = token.trim();
+    const upperSymbol = symbol.toUpperCase();
+
+    // Rimuovi alert vecchi
+    alertsData.active_alerts = alertsData.active_alerts.filter(a =>
+        !(a.device_id === device_id && a.symbol === upperSymbol)
+    );
+
+    if (price === null || price === undefined || price === 0) {
+        saveData();
+        return res.json({ status: "removed" });
+    }
+
+    // Aggiungi nuovo
+    alertsData.active_alerts.push({
+        device_id: device_id || "unknown",
+        exchange: exchange || "bybit",
+        symbol: upperSymbol,
+        price: parseFloat(price),
+        token: cleanToken,
+        chatId: chatId,
+        triggered: false,
+        lastPrice: null
+    });
+
     saveData();
+
+    // Conferma Telegram
+    const confirmText = `✅ <b>Alert Attivo</b>\n\n` +
+                        `<b>Coppia:</b> ${upperSymbol}\n` +
+                        `<b>Target:</b> ${parseFloat(price)}\n` +
+                        `<b>Exchange:</b> ${exchange.toUpperCase()}`;
+
+    try {
+        await axios.post(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
+            chat_id: chatId,
+            text: confirmText,
+            parse_mode: "HTML"
+        });
+    } catch (e) {
+        console.error("❌ Errore conferma Telegram:", e.response?.data || e.message);
+    }
+
     res.json({ status: "ok" });
 });
 
 app.get("/debug", (req, res) => res.json(alertsData));
 
-// --- GESTIONE FRONTEND (FIX PERCORSI) ---
-app.get("/", (req, res) => {
-    const indexPath = path.join(__dirname, "index.html");
-    if (fs.existsSync(indexPath)) {
-        res.sendFile(indexPath);
-    } else {
-        res.status(404).send("Errore: index.html non trovato nella root del server.");
-    }
+// === SERVING FILE STATICI DALLA ROOT (nessuna cartella public) ===
+app.use(express.static(__dirname));
+
+// === CATCH-ALL PER SPA: serve sempre index.html per route non-file ===
+app.get('*', (req, res) => {
+    // Se la richiesta è per un file con estensione (css, js, png, ecc.), express.static lo gestisce già
+    // Altrimenti, serve index.html (perfetto per refresh SPA)
+    res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-app.get("*", (req, res) => {
-    const indexPath = path.join(__dirname, "index.html");
-    if (!req.path.includes(".") && fs.existsSync(indexPath)) {
-        res.sendFile(indexPath);
-    } else {
-        res.status(404).send("File non trovato.");
-    }
-});
-
-// --- LOGICA PREZZI ---
+// === MONITORAGGIO PREZZI ===
 async function checkAlerts() {
     if (alertsData.active_alerts.length === 0) return;
+
     let changed = false;
 
     for (let alert of alertsData.active_alerts) {
+        if (alert.triggered) continue;
+
         try {
-            const url = alert.exchange === "binance" 
+            const url = alert.exchange.toLowerCase() === "binance"
                 ? `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${alert.symbol}`
                 : `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${alert.symbol}`;
-            
-            const r = await axios.get(url);
-            const currentPrice = alert.exchange === "binance" ? parseFloat(r.data.price) : parseFloat(r.data.result.list[0].lastPrice);
 
-            if (alert.lastPrice && ((alert.lastPrice < alert.price && currentPrice >= alert.price) || (alert.lastPrice > alert.price && currentPrice <= alert.price))) {
-                await axios.post(`https://api.telegram.org/bot${alert.token}/sendMessage`, {
-                    chat_id: alert.chatId,
-                    text: `🚨 <b>TARGET!</b>\n${alert.symbol}: ${currentPrice}`,
-                    parse_mode: "HTML"
-                });
-                alert.triggered = true;
-                changed = true;
+            const r = await axios.get(url);
+            const currentPrice = alert.exchange.toLowerCase() === "binance"
+                ? parseFloat(r.data.price)
+                : parseFloat(r.data.result.list[0].lastPrice);
+
+            if (alert.lastPrice !== null) {
+                const crossed = (alert.lastPrice < alert.price && currentPrice >= alert.price) ||
+                                (alert.lastPrice > alert.price && currentPrice <= alert.price);
+
+                if (crossed) {
+                    const text = `🚨 <b>TARGET RAGGIUNTO!</b>\n\n` +
+                                 `<b>Coppia:</b> ${alert.symbol}\n` +
+                                 `<b>Target:</b> ${alert.price}\n` +
+                                 `<b>Prezzo attuale:</b> ${currentPrice}\n` +
+                                 `<b>Exchange:</b> ${alert.exchange.toUpperCase()}`;
+
+                    await axios.post(`https://api.telegram.org/bot${alert.token}/sendMessage`, {
+                        chat_id: alert.chatId,
+                        text: text,
+                        parse_mode: "HTML"
+                    });
+
+                    alert.triggered = true;
+                    changed = true;
+                }
             }
+
             alert.lastPrice = currentPrice;
-        } catch (e) { continue; }
+        } catch (e) {
+            console.error(`Errore prezzo ${alert.symbol}:`, e.message);
+        }
     }
+
     if (changed) {
         alertsData.active_alerts = alertsData.active_alerts.filter(a => !a.triggered);
         saveData();
     }
 }
 
-loadData();
 setInterval(checkAlerts, 5000);
-app.listen(PORT, () => console.log(`🚀 Server pronto sulla porta ${PORT}`));
+
+app.listen(PORT, () => {
+    console.log(`🚀 Server pronto sulla porta ${PORT}`);
+});
