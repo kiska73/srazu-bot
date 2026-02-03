@@ -40,7 +40,7 @@ function saveData() {
 
 loadData();
 
-// === API ROUTES (definite PRIMA del serving statico) ===
+// === API ROUTES ===
 app.post("/set_alert", async (req, res) => {
     const { device_id, exchange, symbol, price, token, chatId } = req.body;
 
@@ -96,17 +96,15 @@ app.post("/set_alert", async (req, res) => {
 
 app.get("/debug", (req, res) => res.json(alertsData));
 
-// === SERVING FILE STATICI DALLA ROOT (nessuna cartella public) ===
+// === SERVING FILE STATICI DALLA ROOT ===
 app.use(express.static(__dirname));
 
 // === CATCH-ALL PER SPA: serve sempre index.html per route non-file ===
 app.get('*', (req, res) => {
-    // Se la richiesta è per un file con estensione (css, js, png, ecc.), express.static lo gestisce già
-    // Altrimenti, serve index.html (perfetto per refresh SPA)
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// === MONITORAGGIO PREZZI ===
+// === LOGICA MONITORAGGIO PREZZI ===
 async function checkAlerts() {
     if (alertsData.active_alerts.length === 0) return;
 
