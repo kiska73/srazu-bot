@@ -96,13 +96,7 @@ app.post("/set_alert", async (req, res) => {
 
 app.get("/debug", (req, res) => res.json(alertsData));
 
-// === SERVING FILE STATICI DALLA ROOT ===
-app.use(express.static(__dirname));
-
-// === CATCH-ALL PER SPA: serve sempre index.html per route non-file ===
-app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'index.html'));
-});
+app.get("/", (req, res) => res.send("Backend running – Legge, monitora e messaggia alert."));
 
 // === LOGICA MONITORAGGIO PREZZI ===
 async function checkAlerts() {
