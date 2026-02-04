@@ -122,10 +122,10 @@ async function checkAlerts() {
                                 (alert.lastPrice > alert.price && currentPrice <= alert.price);
 
                 if (crossed) {
-                    const text = `🚨 <b>TARGET RAGGIUNTO!</b>\n\n` +
-                                 `<b>Coppia:</b> ${alert.symbol}\n` +
+                    const text = `🎯 <b>TARGET HIT!</b>\n\n` +
+                                 `<b>Pair:</b> ${alert.symbol}\n` +
                                  `<b>Target:</b> ${alert.price}\n` +
-                                 `<b>Prezzo attuale:</b> ${currentPrice}\n` +
+                                 `<b>Price current:</b> ${currentPrice}\n` +
                                  `<b>Exchange:</b> ${alert.exchange.toUpperCase()}`;
 
                     await axios.post(`https://api.telegram.org/bot${alert.token}/sendMessage`, {
