@@ -76,8 +76,8 @@ app.post("/set_alert", async (req, res) => {
     saveData();
 
     // Conferma Telegram
-    const confirmText = `✅ <b>Alert Attivo</b>\n\n` +
-                        `<b>Coppia:</b> ${upperSymbol}\n` +
+    const confirmText = `✅ <b>Alert Activated</b>\n\n` +
+                        `<b>Pair:</b> ${upperSymbol}\n` +
                         `<b>Target:</b> ${parseFloat(price)}\n` +
                         `<b>Exchange:</b> ${exchange.toUpperCase()}`;
 
