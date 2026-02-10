@@ -85,7 +85,7 @@ app.post("/set_alert", async (req, res) => {
     const confirmLevel = finalSyncPrice.toFixed(finalSyncPrice < 1 ? 6 : 2);
     const confirmText = `✅ <b>Alert Activated</b>\n\n` +
                         `<b>Pair:</b> ${upperSymbol}\n` +
-                        `<b>Approach level:</b> $${confirmLevel}\n` +
+                        `<b>Alert level:</b> $${confirmLevel}\n` +
                         `<b>Exchange:</b> ${lowerExchange.toUpperCase()}`;
 
     try {
@@ -133,11 +133,11 @@ async function checkAlerts() {
                 if (crossed) {
                     const level = alert.sync_price.toFixed(precision);
 
-                    const text = `🚨 <b>${alert.symbol} approaching the synchronized level!</b>\n\n` +
+                    const text = `🚨 <b>${alert.symbol} Approaching level!</b>\n\n` +
                                  `<b>Level:</b> $${level}\n` +
                                  `<b>Current price:</b> $${currentPrice.toFixed(precision)}\n` +
                                  `<b>Exchange:</b> ${alert.exchange.toUpperCase()}\n\n` +
-                                 `Apri in app:`;
+                                 `Open app:`;
 
                     let link = "";
                     if (alert.exchange === "bybit") {
@@ -146,7 +146,7 @@ async function checkAlerts() {
                         link = `https://www.binance.com/en/futures/${alert.symbol}`;
                     }
 
-                    const fullText = text + `\n<a href="${link}">📱 Apri ${alert.exchange.toUpperCase()} app</a>`;
+                    const fullText = text + `\n<a href="${link}">📱 Open ${alert.exchange.toUpperCase()} app</a>`;
 
                     await axios.post(`https://api.telegram.org/bot${alert.token}/sendMessage`, {
                         chat_id: alert.chatId,
