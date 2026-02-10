@@ -52,12 +52,16 @@ app.post("/set_alert", async (req, res) => {
     const upperSymbol = symbol.toUpperCase();
     const lowerExchange = (exchange || "bybit").toLowerCase();
 
-    // Rimuovi alert vecchi per stessa coppia e device
+    // Usa alert_price o fallback (compatibilità vecchi alert)
+    const finalAlertPrice = alert_price || 0;
+    const finalSyncPrice = sync_price || finalAlertPrice;
+
+    // Rimuovi alert vecchi
     alertsData.active_alerts = alertsData.active_alerts.filter(a =>
         !(a.device_id === device_id && a.symbol === upperSymbol)
     );
 
-    if (alert_price === null || alert_price === undefined || alert_price === 0) {
+    if (finalAlertPrice === null || finalAlertPrice === undefined || finalAlertPrice === 0) {
         saveData();
         return res.json({ status: "removed" });
     }
@@ -67,8 +71,8 @@ app.post("/set_alert", async (req, res) => {
         device_id: device_id || "unknown",
         exchange: lowerExchange,
         symbol: upperSymbol,
-        alert_price: parseFloat(alert_price),      // per controllo scatto
-        sync_price: parseFloat(sync_price || alert_price), // per messaggio "approaching level"
+        alert_price: parseFloat(finalAlertPrice),
+        sync_price: parseFloat(finalSyncPrice),
         token: cleanToken,
         chatId: chatId,
         triggered: false,
@@ -78,10 +82,10 @@ app.post("/set_alert", async (req, res) => {
     saveData();
 
     // Conferma Telegram (usa sync_price se disponibile)
-    const confirmPrice = sync_price ? parseFloat(sync_price) : parseFloat(alert_price);
+    const confirmLevel = finalSyncPrice.toFixed(finalSyncPrice < 1 ? 6 : 2);
     const confirmText = `✅ <b>Alert Activated</b>\n\n` +
                         `<b>Pair:</b> ${upperSymbol}\n` +
-                        `<b>Approach level:</b> ${confirmPrice}\n` +
+                        `<b>Approach level:</b> $${confirmLevel}\n` +
                         `<b>Exchange:</b> ${lowerExchange.toUpperCase()}`;
 
     try {
@@ -120,26 +124,26 @@ async function checkAlerts() {
                 ? parseFloat(r.data.price)
                 : parseFloat(r.data.result.list[0].lastPrice);
 
+            const precision = currentPrice < 1 ? 6 : 2;
+
             if (alert.lastPrice !== null) {
                 const crossed = (alert.lastPrice < alert.alert_price && currentPrice >= alert.alert_price) ||
                                 (alert.lastPrice > alert.alert_price && currentPrice <= alert.alert_price);
 
                 if (crossed) {
-                    const precision = currentPrice < 1 ? 6 : 2;
+                    const level = alert.sync_price.toFixed(precision);
 
-                    // Messaggio con "approaching level" + valore sync_price
-                    const text = `🚨 <b>${alert.symbol} approaching level!</b>\n\n` +
-                                 `<b>Level:</b> $${alert.sync_price.toFixed(precision)}\n` +
+                    const text = `🚨 <b>${alert.symbol} approaching the synchronized level!</b>\n\n` +
+                                 `<b>Level:</b> $${level}\n` +
                                  `<b>Current price:</b> $${currentPrice.toFixed(precision)}\n` +
                                  `<b>Exchange:</b> ${alert.exchange.toUpperCase()}\n\n` +
                                  `Apri in app:`;
 
-                    // Deep link + fallback web
                     let link = "";
                     if (alert.exchange === "bybit") {
-                        link = `https://www.bybit.com/trade/usdt/${alert.symbol}`; // apre app Bybit se installata
+                        link = `https://www.bybit.com/trade/usdt/${alert.symbol}`;
                     } else if (alert.exchange === "binance") {
-                        link = `https://www.binance.com/en/futures/${alert.symbol}`; // apre app Binance Futures se installata
+                        link = `https://www.binance.com/en/futures/${alert.symbol}`;
                     }
 
                     const fullText = text + `\n<a href="${link}">📱 Apri ${alert.exchange.toUpperCase()} app</a>`;
