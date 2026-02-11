@@ -137,7 +137,7 @@ async function checkAlerts() {
                                  `<b>Level:</b> $${level}\n` +
                                  `<b>Current price:</b> $${currentPrice.toFixed(precision)}\n` +
                                  `<b>Exchange:</b> ${alert.exchange.toUpperCase()}\n\n` +
-                                 `Open app:`;
+                                 `Open trading:`;
 
                     let link = "";
                     if (alert.exchange === "bybit") {
@@ -146,7 +146,7 @@ async function checkAlerts() {
                         link = `https://www.binance.com/en/futures/${alert.symbol}`;
                     }
 
-                    const fullText = text + `\n<a href="${link}">📱 Open ${alert.exchange.toUpperCase()} app</a>`;
+                    const fullText = text + `\n<a href="${link}">📱 Open ${alert.exchange.toUpperCase()} (app/web)</a>`;
 
                     await axios.post(`https://api.telegram.org/bot${alert.token}/sendMessage`, {
                         chat_id: alert.chatId,
