@@ -146,7 +146,7 @@ async function checkAlerts() {
                         link = `https://www.binance.com/en/futures/${alert.symbol}`;
                     }
 
-                    const fullText = text + `\n<a href="${link}">📱 Open ${alert.exchange.toUpperCase()} (app/web)</a>`;
+                    const fullText = text + `\n<a href="${link}">📱 Open ${alert.exchange.toUpperCase()}</a>`;
 
                     await axios.post(`https://api.telegram.org/bot${alert.token}/sendMessage`, {
                         chat_id: alert.chatId,
