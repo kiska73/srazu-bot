@@ -52,11 +52,9 @@ app.post("/set_alert", async (req, res) => {
     const upperSymbol = symbol.toUpperCase();
     const lowerExchange = (exchange || "bybit").toLowerCase();
 
-    // Usa alert_price o fallback (compatibilità vecchi alert)
     const finalAlertPrice = alert_price || 0;
     const finalSyncPrice = sync_price || finalAlertPrice;
 
-    // Rimuovi alert vecchi
     alertsData.active_alerts = alertsData.active_alerts.filter(a =>
         !(a.device_id === device_id && a.symbol === upperSymbol)
     );
@@ -66,7 +64,6 @@ app.post("/set_alert", async (req, res) => {
         return res.json({ status: "removed" });
     }
 
-    // Aggiungi nuovo alert
     alertsData.active_alerts.push({
         device_id: device_id || "unknown",
         exchange: lowerExchange,
@@ -81,7 +78,7 @@ app.post("/set_alert", async (req, res) => {
 
     saveData();
 
-    // Conferma Telegram (usa sync_price se disponibile)
+    // Conferma Telegram in inglese
     const confirmLevel = finalSyncPrice.toFixed(finalSyncPrice < 1 ? 6 : 2);
     const confirmText = `✅ <b>Alert Activated</b>\n\n` +
                         `<b>Pair:</b> ${upperSymbol}\n` +
@@ -136,23 +133,34 @@ async function checkAlerts() {
                     const text = `🚨 <b>${alert.symbol} Approaching level!</b>\n\n` +
                                  `<b>Level:</b> $${level}\n` +
                                  `<b>Current price:</b> $${currentPrice.toFixed(precision)}\n` +
-                                 `<b>Exchange:</b> ${alert.exchange.toUpperCase()}\n\n` +
-                                 `Open trading:`;
+                                 `<b>Exchange:</b> ${alert.exchange.toUpperCase()}`;
 
                     let link = "";
+                    let buttonText = "";
+
                     if (alert.exchange === "bybit") {
-                        link = `https://www.bybit.com/trade/usdt/${alert.symbol}`;
+                        link = `intent://trade/usdt/${alert.symbol}#Intent;scheme=bybit;package=com.bybit.app;action=android.intent.action.VIEW;end`;
+                        buttonText = "📱 Open Trade";
                     } else if (alert.exchange === "binance") {
-                        link = `https://www.binance.com/en/futures/${alert.symbol}`;
+                        link = `intent://www.binance.com/en/futures/${alert.symbol}#Intent;package=com.binance.dev;action=android.intent.action.VIEW;end`;
+                        buttonText = "📱 Open Trade";
                     }
 
-                    const fullText = text + `\n<a href="${link}">📱 Open ${alert.exchange.toUpperCase()}</a>`;
+                    const replyMarkup = {
+                        inline_keyboard: [[
+                            {
+                                text: buttonText,
+                                url: link
+                            }
+                        ]]
+                    };
 
                     await axios.post(`https://api.telegram.org/bot${alert.token}/sendMessage`, {
                         chat_id: alert.chatId,
-                        text: fullText,
+                        text: text,
                         parse_mode: "HTML",
-                        disable_web_page_preview: true
+                        disable_web_page_preview: true,
+                        reply_markup: replyMarkup
                     });
 
                     alert.triggered = true;
